@@ -28,9 +28,8 @@ func main() {
 		targetBits = uint(bits.TrailingZeros64(opts.TargetPieceSize))
 	}
 
-	cp := commp.NewAccumulator()
-
 	log.Println("Reading from STDIN...")
+	cp := new(commp.Calc)
 	n, err := io.Copy(cp, os.Stdin)
 	if err != nil {
 		log.Fatal(err)

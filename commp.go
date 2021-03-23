@@ -18,15 +18,21 @@ import (
 	"golang.org/x/xerrors"
 )
 
-type Accumulator struct {
-	mu             sync.Mutex
-	bytesProcessed uint64
-	carry          []byte
-	layerQueues    []chan []byte
-	resultCommP    chan []byte
+// Calc is an implementation of a commP "hash" calculator, implementing the
+// familiar hash.Hash interface. The zero-value of this object is ready to
+// accept Write()s without further initialization.
+type Calc struct {
+	state
+	mu sync.Mutex
+}
+type state struct {
+	bytesConsumed uint64
+	carry         []byte
+	layerQueues   []chan []byte
+	resultCommP   chan []byte
 }
 
-var _ hash.Hash = &Accumulator{} // make sure we are hash.Hash compliant
+var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
 
 const MaxLayers = uint(31) // result of log2( 64 GiB / 32 )
 const MaxPiecePayload = uint64((1 << MaxLayers) * 32 / 128 * 127)
@@ -51,34 +57,28 @@ func init() {
 	}
 }
 
-// NewAccumulator returns a commP accumulator object, implementing the familiar
-// hash.Hash interface.
-func NewAccumulator() *Accumulator {
-	acc := &Accumulator{}
-	acc.reset() // initialize state
-	return acc
-}
-
 // BlockSize is the amount of bytes consumed by the commP algorithm in one go
 // Write()ing data in multiples of BlockSize would obviate the need to maintain
-// an internal carry buffer.
-func (acc *Accumulator) BlockSize() int { return 127 }
+// an internal carry buffer. The BlockSize of this module is 127 bytes.
+func (cp *Calc) BlockSize() int { return 127 }
 
-// Size is the amount of bytes returned as digest
-func (acc *Accumulator) Size() int { return 32 }
+// Size is the amount of bytes returned on Sum()/Digest(), which is 32 bytes
+// for this module.
+func (cp *Calc) Size() int { return 32 }
 
 // Reset re-initializes the accumulator object, clearing its state and
 // terminating all background goroutines. It is safe to Reset() an accumulator
 // in any state.
-func (acc *Accumulator) Reset() {
-	acc.mu.Lock()
-	if acc.bytesProcessed != 0 {
-		// we are resetting without digesting: close everything out
-		close(acc.layerQueues[0])
-		<-acc.resultCommP
+func (cp *Calc) Reset() {
+	cp.mu.Lock()
+	if cp.bytesConsumed != 0 {
+		// we are resetting without digesting: close everything out to terminate
+		// the layer workers
+		close(cp.layerQueues[0])
+		<-cp.resultCommP
 	}
-	acc.reset()
-	acc.mu.Unlock()
+	cp.state = state{} // reset
+	cp.mu.Unlock()
 }
 
 // Sum is a thin wrapper around Digest() and is provided solely to satisfy
@@ -86,8 +86,8 @@ func (acc *Accumulator) Reset() {
 // Note that unlike classic (hash.Hash).Sum(), calling this method is
 // destructive: the internal state is reset and all goroutines kicked off
 // by Write() are terminated.
-func (acc *Accumulator) Sum(buf []byte) []byte {
-	commP, _, err := acc.Digest()
+func (cp *Calc) Sum(buf []byte) []byte {
+	commP, _, err := cp.Digest()
 	if err != nil {
 		panic(err)
 	}
@@ -98,109 +98,110 @@ func (acc *Accumulator) Sum(buf []byte) []byte {
 // bytes of commP and the padded piece size, or alternatively an error in
 // case of insufficient accumulated state. On success invokes Reset(), which
 // terminates all goroutines kicked off by Write().
-func (acc *Accumulator) Digest() (commP []byte, paddedPieceSize uint64, err error) {
-	acc.mu.Lock()
+func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
+	cp.mu.Lock()
 
-	if acc.bytesProcessed < 65 {
-		acc.mu.Unlock()
-		return nil, 0, xerrors.Errorf(
+	defer func() {
+		// reset only if we did succeed
+		if err == nil {
+			cp.state = state{}
+		}
+		cp.mu.Unlock()
+	}()
+
+	if cp.bytesConsumed < 65 {
+		err = xerrors.Errorf(
 			"insufficient state accumulated: commP is not defined for inputs shorter than 65 bytes, but only %d processed so far",
-			acc.bytesProcessed,
+			cp.bytesConsumed,
 		)
+		return
 	}
 
-	if len(acc.carry) > 0 {
-		if 127-len(acc.carry) > 0 {
-			acc.carry = append(acc.carry, make([]byte, 127-len(acc.carry))...)
+	if len(cp.carry) > 0 {
+		if 127-len(cp.carry) > 0 {
+			cp.carry = append(cp.carry, make([]byte, 127-len(cp.carry))...)
 		}
-		acc.digest127bytes(acc.carry)
+		cp.digest127bytes(cp.carry)
 	}
 
 	// This is how we signal to the bottom of the stack that we are done
 	// which in turn collapses the rest all the way to acc.resultCommP
-	close(acc.layerQueues[0])
+	close(cp.layerQueues[0])
 
-	paddedPieceSize = ((acc.bytesProcessed + 126) / 127 * 128) // why is 6 afraid of 7...?
+	paddedPieceSize = ((cp.bytesConsumed + 126) / 127 * 128) // why is 6 afraid of 7...?
 
+	// hacky round-up-to-next-pow2
 	if bits.OnesCount64(paddedPieceSize) != 1 {
 		paddedPieceSize = 1 << uint(64-bits.LeadingZeros64(paddedPieceSize))
 	}
 
-	commP = <-acc.resultCommP
-
-	acc.reset()
-
-	acc.mu.Unlock()
-
-	return commP, paddedPieceSize, nil
-}
-
-// lock-less workhorse to be called by Reset/Digest
-func (acc *Accumulator) reset() {
-	acc.layerQueues = make([]chan []byte, MaxLayers)
-	acc.resultCommP = make(chan []byte, 1)
-	acc.carry = make([]byte, 0, 127)
-	acc.bytesProcessed = 0
+	return <-cp.resultCommP, paddedPieceSize, nil
 }
 
 // Write adds bytes to the accumulator, for a subsequent Digest(). Upon the
 // first call of this method a few goroutines are started in the background to
 // service each layer of the digest tower. If you wrote some data and then
 // decide to abandon the object without invoking Digest(), you need to call
-// Reset() to terminate all remaining background workers.
-func (acc *Accumulator) Write(input []byte) (int, error) {
+// Reset() to terminate all remaining background workers. Unlike a typical
+// (hash.Hash).Write, calling this method can return an error when the total
+// amount of bytes is about to go over the maximum currently supported by
+// Filecoin.
+func (cp *Calc) Write(input []byte) (int, error) {
 	inputSize := len(input)
 	if inputSize == 0 {
 		return 0, nil
 	}
 
-	acc.mu.Lock()
-	defer acc.mu.Unlock()
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
 
-	if acc.bytesProcessed+uint64(inputSize) > MaxPiecePayload {
+	if cp.bytesConsumed+uint64(inputSize) > MaxPiecePayload {
 		return 0, xerrors.Errorf(
 			"writing %d bytes to the accumulator would overflow the maximum supported unpadded piece size %d",
 			len(input), MaxPiecePayload,
 		)
 	}
 
-	// just starting
-	if acc.bytesProcessed == 0 {
-		acc.layerQueues[0] = make(chan []byte, layerQueueDepth)
-		acc.addLayer(0)
+	// just starting: initialize internal state, start first background layer-goroutine
+	if cp.bytesConsumed == 0 {
+		cp.carry = make([]byte, 0, 127)
+		cp.resultCommP = make(chan []byte, 1)
+		cp.layerQueues = make([]chan []byte, MaxLayers)
+		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
+		cp.addLayer(0)
 	}
 
-	acc.bytesProcessed += uint64(inputSize)
+	cp.bytesConsumed += uint64(inputSize)
 
-	carrySize := len(acc.carry)
+	carrySize := len(cp.carry)
 	if carrySize > 0 {
 
 		// super short Write - just carry it
 		if carrySize+inputSize < 127 {
-			acc.carry = append(acc.carry, input...)
+			cp.carry = append(cp.carry, input...)
 			return inputSize, nil
 		}
 
-		acc.carry = append(acc.carry, input[:127-carrySize]...)
-		acc.digest127bytes(acc.carry)
-		acc.carry = acc.carry[:0]
+		cp.carry = append(cp.carry, input[:127-carrySize]...)
+		cp.digest127bytes(cp.carry)
+		cp.carry = cp.carry[:0]
 		input = input[127-carrySize:]
 	}
 
 	for len(input) >= 127 {
-		acc.digest127bytes(input)
+		cp.digest127bytes(input)
 		input = input[127:]
 	}
 
-	acc.carry = acc.carry[:len(input)]
+	cp.carry = cp.carry[:len(input)]
 	if len(input) > 0 {
-		copy(acc.carry, input)
+		copy(cp.carry, input)
 	}
 
 	return inputSize, nil
 }
 
-func (acc *Accumulator) digest127bytes(input []byte) {
+func (cp *Calc) digest127bytes(input []byte) {
 
 	// Holds this round's shifts of the original 127 bytes plus the 6 bit overflow
 	// at the end of the expansion cycle. We *do not* reuse the slice: it is being
@@ -249,40 +250,40 @@ func (acc *Accumulator) digest127bytes(input []byte) {
 	// the final 6 bit remainder is exactly the value of the last expanded byte
 	expander[127] = input[126] >> 2
 
-	acc.hash254Into(acc.layerQueues[0], expander[:64])
-	acc.hash254Into(acc.layerQueues[0], expander[64:])
+	cp.hash254Into(cp.layerQueues[0], expander[:64])
+	cp.hash254Into(cp.layerQueues[0], expander[64:])
 }
 
-func (acc *Accumulator) addLayer(myIdx int) {
+func (cp *Calc) addLayer(myIdx int) {
 	// the next layer channel, which we might *not* use
-	acc.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
+	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
 
 	go func() {
 		var chunkHold []byte
 
 		for {
 
-			chunk, queueIsOpen := <-acc.layerQueues[myIdx]
+			chunk, queueIsOpen := <-cp.layerQueues[myIdx]
 
 			// the dream is collapsing
 			if !queueIsOpen {
 
 				// I am last
-				if acc.layerQueues[myIdx+2] == nil {
-					acc.resultCommP <- chunkHold
+				if cp.layerQueues[myIdx+2] == nil {
+					cp.resultCommP <- chunkHold
 					return
 				}
 
 				if chunkHold != nil {
-					acc.hash254Into(
-						acc.layerQueues[myIdx+1],
+					cp.hash254Into(
+						cp.layerQueues[myIdx+1],
 						chunkHold,
 						stackedNulPadding[myIdx+1], // stackedNulPadding is one longer than the main queue
 					)
 				}
 
 				// signal the next in line that they are done too
-				close(acc.layerQueues[myIdx+1])
+				close(cp.layerQueues[myIdx+1])
 				return
 			}
 
@@ -291,18 +292,18 @@ func (acc *Accumulator) addLayer(myIdx int) {
 			} else {
 
 				// I am last right now
-				if acc.layerQueues[myIdx+2] == nil {
-					acc.addLayer(myIdx + 1)
+				if cp.layerQueues[myIdx+2] == nil {
+					cp.addLayer(myIdx + 1)
 				}
 
-				acc.hash254Into(acc.layerQueues[myIdx+1], chunkHold, chunk)
+				cp.hash254Into(cp.layerQueues[myIdx+1], chunkHold, chunk)
 				chunkHold = nil
 			}
 		}
 	}()
 }
 
-func (acc *Accumulator) hash254Into(out chan<- []byte, data ...[]byte) {
+func (cp *Calc) hash254Into(out chan<- []byte, data ...[]byte) {
 	h := sha256simd.New()
 	for i := range data {
 		h.Write(data[i])
@@ -312,7 +313,7 @@ func (acc *Accumulator) hash254Into(out chan<- []byte, data ...[]byte) {
 	out <- d
 }
 
-// PadCommP is experimental, do not use it
+// PadCommP is experimental, do not use it.
 func PadCommP(sourceCommP []byte, sourcePieceBitsize, targetPieceBitsize uint) ([]byte, error) {
 
 	out := make([]byte, 32)
