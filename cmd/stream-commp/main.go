@@ -3,7 +3,6 @@ package main
 import (
 	"io"
 	"log"
-	"math/bits"
 	"os"
 
 	commcid "github.com/filecoin-project/go-fil-commcid"
@@ -20,14 +19,6 @@ func main() {
 
 	options.RegisterAndParse(opts)
 
-	var targetBits uint
-	if opts.TargetPieceSize > 0 {
-		if opts.TargetPieceSize < 65 || bits.OnesCount64(opts.TargetPieceSize) != 1 {
-			log.Fatalf("supplied --target-piece-size should be a power of 2, larger than 64")
-		}
-		targetBits = uint(bits.TrailingZeros64(opts.TargetPieceSize))
-	}
-
 	log.Println("Reading from STDIN...")
 	cp := new(commp.Calc)
 	n, err := io.Copy(cp, os.Stdin)
@@ -40,18 +31,16 @@ func main() {
 		log.Fatal(err)
 	}
 
-	paddedSizeBits := uint(bits.TrailingZeros64(paddedSize))
-
-	if targetBits > 0 {
+	if opts.TargetPieceSize > 0 {
 		rawCommP, err = commp.PadCommP(
 			rawCommP,
-			paddedSizeBits,
-			targetBits,
+			paddedSize,
+			opts.TargetPieceSize,
 		)
 		if err != nil {
 			log.Fatal(err)
 		}
-		paddedSize = 1 << targetBits
+		paddedSize = opts.TargetPieceSize
 	}
 
 	commCid, err := commcid.DataCommitmentV1ToCID(rawCommP)

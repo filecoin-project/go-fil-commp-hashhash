@@ -314,32 +314,40 @@ func (cp *Calc) hash254Into(out chan<- []byte, data ...[]byte) {
 }
 
 // PadCommP is experimental, do not use it.
-func PadCommP(sourceCommP []byte, sourcePieceBitsize, targetPieceBitsize uint) ([]byte, error) {
+func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]byte, error) {
+
+	if bits.OnesCount64(sourcePaddedSize) != 1 {
+		return nil, xerrors.Errorf("source padded size %d is not a power of 2", sourcePaddedSize)
+	}
+	if bits.OnesCount64(targetPaddedSize) != 1 {
+		return nil, xerrors.Errorf("target padded size %d is not a power of 2", targetPaddedSize)
+	}
+	if sourcePaddedSize > targetPaddedSize {
+		return nil, xerrors.Errorf("source padded size %d larger than target padded size %d", sourcePaddedSize, targetPaddedSize)
+	}
+	if sourcePaddedSize < 128 {
+		return nil, xerrors.Errorf("source padded size %d smaller than the minimum of 128 bytes", sourcePaddedSize)
+	}
+	if targetPaddedSize > 1<<(MaxLayers+5) {
+		return nil, xerrors.Errorf("target padded size %d larger than Filecoin maximum of %d bytes", targetPaddedSize, 1<<(MaxLayers+5))
+	}
+
+	// noop
+	if sourcePaddedSize == targetPaddedSize {
+		return sourceCommP, nil
+	}
 
 	out := make([]byte, 32)
 	copy(out, sourceCommP)
 
-	if targetPieceBitsize > MaxLayers+5 {
-		return nil, xerrors.Errorf(
-			"target bitsize %d larger than the maximum %d (%dGiB)",
-			targetPieceBitsize, MaxLayers+5, 1<<(MaxLayers-25),
-		)
-	}
-
-	if sourcePieceBitsize > targetPieceBitsize {
-		return nil, xerrors.Errorf("source bitsize %d larger than target %d", sourcePieceBitsize, targetPieceBitsize)
-	}
-
-	// noop
-	if sourcePieceBitsize == targetPieceBitsize {
-		return sourceCommP, nil
-	}
+	s := bits.TrailingZeros64(sourcePaddedSize)
+	t := bits.TrailingZeros64(targetPaddedSize)
 
 	h := sha256simd.New()
-	for i := sourcePieceBitsize; i < targetPieceBitsize; i++ {
+	for ; s < t; s++ {
 		h.Reset()
 		h.Write(out)
-		h.Write(stackedNulPadding[i-5]) // account for 32byte chunks + off-by-one padding tower offset
+		h.Write(stackedNulPadding[s-5]) // account for 32byte chunks + off-by-one padding tower offset
 		out = h.Sum(out[:0])
 		out[31] &= 0x3F
 	}
