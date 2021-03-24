@@ -195,8 +195,8 @@ func (cp *Calc) Write(input []byte) (int, error) {
 		input = input[127:]
 	}
 
-	cp.carry = cp.carry[:len(input)]
 	if len(input) > 0 {
+		cp.carry = cp.carry[:len(input)]
 		copy(cp.carry, input)
 	}
 
