@@ -41,9 +41,11 @@ const layerQueueDepth = 256 // SANCHECK: too much? too little? can't think this 
 
 var stackedNulPadding = make([][]byte, MaxLayers)
 
+var shaPool = sync.Pool{New: func() interface{} { return sha256simd.New() }}
+
 // initialize the nul padding stack (cheap to do upfront, just MaxLayers loops)
 func init() {
-	h := sha256simd.New()
+	h := shaPool.Get().(hash.Hash)
 	for i := range stackedNulPadding {
 		if i == 0 {
 			stackedNulPadding[0] = make([]byte, 32)
@@ -55,6 +57,7 @@ func init() {
 			stackedNulPadding[i][31] &= 0x3F
 		}
 	}
+	shaPool.Put(h)
 }
 
 // BlockSize is the amount of bytes consumed by the commP algorithm in one go
@@ -309,19 +312,23 @@ func (cp *Calc) addLayer(myIdx int) {
 	}()
 }
 
-func (cp *Calc) hash254Into(out chan<- []byte, data ...[]byte) {
-	h := sha256simd.New()
-	for i := range data {
-		h.Write(data[i])
-	}
-	d := h.Sum(data[0][:0]) // callers expect we will reuse-reduce-recycle
+func (cp *Calc) hash254Into(out chan<- []byte, half1ToOverwrite, half2 []byte) {
+	h := shaPool.Get().(hash.Hash)
+	h.Reset()
+	h.Write(half1ToOverwrite)
+	h.Write(half2)
+	d := h.Sum(half1ToOverwrite[:0]) // callers expect we will reuse-reduce-recycle
 	d[31] &= 0x3F
 	out <- d
+	shaPool.Put(h)
 }
 
 // PadCommP is experimental, do not use it.
 func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]byte, error) {
 
+	if len(sourceCommP) != 32 {
+		return nil, xerrors.Errorf("provided commP must be exactly 32 bytes long, got %d bytes instead", len(sourceCommP))
+	}
 	if bits.OnesCount64(sourcePaddedSize) != 1 {
 		return nil, xerrors.Errorf("source padded size %d is not a power of 2", sourcePaddedSize)
 	}
@@ -349,7 +356,7 @@ func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]
 	s := bits.TrailingZeros64(sourcePaddedSize)
 	t := bits.TrailingZeros64(targetPaddedSize)
 
-	h := sha256simd.New()
+	h := shaPool.Get().(hash.Hash)
 	for ; s < t; s++ {
 		h.Reset()
 		h.Write(out)
@@ -357,6 +364,7 @@ func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]
 		out = h.Sum(out[:0])
 		out[31] &= 0x3F
 	}
+	shaPool.Put(h)
 
 	return out, nil
 }
