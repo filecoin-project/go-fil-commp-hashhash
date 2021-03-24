@@ -37,7 +37,7 @@ var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
 const MaxLayers = uint(31) // result of log2( 64 GiB / 32 )
 const MaxPiecePayload = uint64((1 << MaxLayers) * 32 / 128 * 127)
 
-const layerQueueDepth = 8 // SANCHECK: too much? too little? can't think this through right now...
+const layerQueueDepth = 256 // SANCHECK: too much? too little? can't think this through right now...
 
 var stackedNulPadding = make([][]byte, MaxLayers)
 
@@ -117,11 +117,12 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 		return
 	}
 
+	// If any, flush remaining bytes padded up with zeroes
 	if len(cp.carry) > 0 {
 		if 127-len(cp.carry) > 0 {
 			cp.carry = append(cp.carry, make([]byte, 127-len(cp.carry))...)
 		}
-		cp.digest127bytes(cp.carry)
+		cp.digestLeading127Bytes(cp.carry)
 	}
 
 	// This is how we signal to the bottom of the stack that we are done
@@ -183,13 +184,14 @@ func (cp *Calc) Write(input []byte) (int, error) {
 		}
 
 		cp.carry = append(cp.carry, input[:127-carrySize]...)
-		cp.digest127bytes(cp.carry)
-		cp.carry = cp.carry[:0]
 		input = input[127-carrySize:]
+
+		cp.digestLeading127Bytes(cp.carry)
+		cp.carry = cp.carry[:0]
 	}
 
 	for len(input) >= 127 {
-		cp.digest127bytes(input)
+		cp.digestLeading127Bytes(input)
 		input = input[127:]
 	}
 
@@ -201,7 +203,7 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	return inputSize, nil
 }
 
-func (cp *Calc) digest127bytes(input []byte) {
+func (cp *Calc) digestLeading127Bytes(input []byte) {
 
 	// Holds this round's shifts of the original 127 bytes plus the 6 bit overflow
 	// at the end of the expansion cycle. We *do not* reuse the slice: it is being
@@ -212,10 +214,9 @@ func (cp *Calc) digest127bytes(input []byte) {
 	// 31 + 1 + 31 + 1 + 31 + 1 + 31 = 127
 
 	// First 31 bytes + 6 bits are taken as-is (trimmed later)
-	// Note that copying them into the expansion buffer is not strictly
-	// necessary: one could feed the range to the hasher directly. However
-	// there are significant optimizations to be had when feeding exactly 64
-	// bytes at a time to the sha256 implementation, thus keeping the copy()
+	// Note that copying them into the expansion buffer is mandatory:
+	// we will be feeding it to the workers which reuse the bottom half
+	// of the chunk for the result
 	copy(expander, input[:32])
 
 	// first 2-bit "shim" forced into the otherwise identical bitstream
@@ -232,6 +233,10 @@ func (cp *Calc) digest127bytes(input []byte) {
 
 	// next 2-bit shim
 	expander[63] &= 0x3F
+
+	// ready to dispatch first half
+	cp.layerQueues[0] <- expander[:32]
+	cp.layerQueues[0] <- expander[32:64]
 
 	//  In: {{ C[7] C[6] C[5] C[4] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
 	// Out:                           X[3] X[2] X[1] X[0] C[7] C[6] C[5] C[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] X[5] X[4] Z[3] Z[2] Z[1]...
@@ -250,8 +255,9 @@ func (cp *Calc) digest127bytes(input []byte) {
 	// the final 6 bit remainder is exactly the value of the last expanded byte
 	expander[127] = input[126] >> 2
 
-	cp.hash254Into(cp.layerQueues[0], expander[:64])
-	cp.hash254Into(cp.layerQueues[0], expander[64:])
+	// and dispatch remainder
+	cp.layerQueues[0] <- expander[64:96]
+	cp.layerQueues[0] <- expander[96:]
 }
 
 func (cp *Calc) addLayer(myIdx int) {
@@ -278,7 +284,7 @@ func (cp *Calc) addLayer(myIdx int) {
 					cp.hash254Into(
 						cp.layerQueues[myIdx+1],
 						chunkHold,
-						stackedNulPadding[myIdx+1], // stackedNulPadding is one longer than the main queue
+						stackedNulPadding[myIdx],
 					)
 				}
 
