@@ -170,7 +170,7 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	if cp.bytesConsumed == 0 {
 		cp.carry = make([]byte, 0, 127)
 		cp.resultCommP = make(chan []byte, 1)
-		cp.layerQueues = make([]chan []byte, MaxLayers)
+		cp.layerQueues = make([]chan []byte, MaxLayers+1) // we use one extra layer for "leaves"
 		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
 		cp.addLayer(0)
 	}
