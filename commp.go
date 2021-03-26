@@ -27,9 +27,9 @@ type Calc struct {
 }
 type state struct {
 	bytesConsumed uint64
-	carry         []byte
-	layerQueues   []chan []byte
+	layerQueues   [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
 	resultCommP   chan []byte
+	carry         []byte
 }
 
 var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
@@ -39,7 +39,7 @@ const MaxPiecePayload = uint64((1 << MaxLayers) * 32 / 128 * 127)
 
 const layerQueueDepth = 256 // SANCHECK: too much? too little? can't think this through right now...
 
-var stackedNulPadding = make([][]byte, MaxLayers)
+var stackedNulPadding [MaxLayers][]byte
 
 var shaPool = sync.Pool{New: func() interface{} { return sha256simd.New() }}
 
@@ -170,7 +170,6 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	if cp.bytesConsumed == 0 {
 		cp.carry = make([]byte, 0, 127)
 		cp.resultCommP = make(chan []byte, 1)
-		cp.layerQueues = make([]chan []byte, MaxLayers+1) // we use one extra layer for "leaves"
 		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
 		cp.addLayer(0)
 	}
@@ -263,7 +262,7 @@ func (cp *Calc) digestLeading127Bytes(input []byte) {
 	cp.layerQueues[0] <- expander[96:]
 }
 
-func (cp *Calc) addLayer(myIdx int) {
+func (cp *Calc) addLayer(myIdx uint) {
 	// the next layer channel, which we might *not* use
 	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
 
@@ -278,7 +277,7 @@ func (cp *Calc) addLayer(myIdx int) {
 			if !queueIsOpen {
 
 				// I am last
-				if cp.layerQueues[myIdx+2] == nil {
+				if myIdx == MaxLayers || cp.layerQueues[myIdx+2] == nil {
 					cp.resultCommP <- chunkHold
 					return
 				}
@@ -300,7 +299,9 @@ func (cp *Calc) addLayer(myIdx int) {
 				chunkHold = chunk
 			} else {
 
-				// I am last right now
+				// We are last right now
+				// N.b.: we will not blow out of the preallocated layerQueues array,
+				// as we disallow Write()s above a certain threshhold
 				if cp.layerQueues[myIdx+2] == nil {
 					cp.addLayer(myIdx + 1)
 				}
