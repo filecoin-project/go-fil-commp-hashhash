@@ -311,7 +311,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 				// We are last right now
 				// n.b. we will not blow out of the preallocated layerQueues array,
-				// as we disallow Write()s above a certain threshhold
+				// as we disallow Write()s above a certain threshold
 				if cp.layerQueues[myIdx+2] == nil {
 					cp.addLayer(myIdx + 1)
 				}

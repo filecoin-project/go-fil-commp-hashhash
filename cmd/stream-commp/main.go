@@ -44,6 +44,9 @@ func main() {
 	}
 
 	commCid, err := commcid.DataCommitmentV1ToCID(rawCommP)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	log.Printf(`Finished:
 CommP:    %x
