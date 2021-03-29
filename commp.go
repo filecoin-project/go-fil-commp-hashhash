@@ -34,33 +34,41 @@ type state struct {
 
 var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
 
+// MaxLayers is the current maximum height of the rust-fil-proofs proving tree.
 const MaxLayers = uint(31) // result of log2( 64 GiB / 32 )
-const MaxPiecePayload = uint64((1 << MaxLayers) * 32 / 128 * 127)
 
-const layerQueueDepth = 256 // SANCHECK: too much? too little? can't think this through right now...
+// MaxPiecePayload is the maximum amount of data that one can Write() to the
+// Calc object, before needing to derive a Digest(). Constrained by the value
+// of MaxLayers.
+const MaxPiecePayload = uint64(127 * (1 << (5 + MaxLayers - 7)))
 
-var stackedNulPadding [MaxLayers][]byte
+// MinPiecePayload is the smallest amount of data for which FR32 padding has
+// a defined result. It is not possible to derive a Digest() before Write()ing
+// at least this amount of bytes.
+const MinPiecePayload = uint64(65)
 
-var shaPool = sync.Pool{New: func() interface{} { return sha256simd.New() }}
+var (
+	layerQueueDepth   = 256 // SANCHECK: too much? too little? can't think this through right now...
+	shaPool           = sync.Pool{New: func() interface{} { return sha256simd.New() }}
+	stackedNulPadding [MaxLayers][]byte
+)
 
 // initialize the nul padding stack (cheap to do upfront, just MaxLayers loops)
 func init() {
 	h := shaPool.Get().(hash.Hash)
-	for i := range stackedNulPadding {
-		if i == 0 {
-			stackedNulPadding[0] = make([]byte, 32)
-		} else {
-			h.Reset()
-			h.Write(stackedNulPadding[i-1]) // yes, got to
-			h.Write(stackedNulPadding[i-1]) // do it twice
-			stackedNulPadding[i] = h.Sum(make([]byte, 0, 32))
-			stackedNulPadding[i][31] &= 0x3F
-		}
+	defer shaPool.Put(h)
+
+	stackedNulPadding[0] = make([]byte, 32)
+	for i := uint(1); i < MaxLayers; i++ {
+		h.Reset()
+		h.Write(stackedNulPadding[i-1]) // yes, got to
+		h.Write(stackedNulPadding[i-1]) // do it twice
+		stackedNulPadding[i] = h.Sum(make([]byte, 0, 32))
+		stackedNulPadding[i][31] &= 0x3F
 	}
-	shaPool.Put(h)
 }
 
-// BlockSize is the amount of bytes consumed by the commP algorithm in one go
+// BlockSize is the amount of bytes consumed by the commP algorithm in one go.
 // Write()ing data in multiples of BlockSize would obviate the need to maintain
 // an internal carry buffer. The BlockSize of this module is 127 bytes.
 func (cp *Calc) BlockSize() int { return 127 }
@@ -112,29 +120,28 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 		cp.mu.Unlock()
 	}()
 
-	if cp.bytesConsumed < 65 {
+	if cp.bytesConsumed < MinPiecePayload {
 		err = xerrors.Errorf(
-			"insufficient state accumulated: commP is not defined for inputs shorter than 65 bytes, but only %d processed so far",
-			cp.bytesConsumed,
+			"insufficient state accumulated: commP is not defined for inputs shorter than %d bytes, but only %d processed so far",
+			MinPiecePayload, cp.bytesConsumed,
 		)
 		return
 	}
 
 	// If any, flush remaining bytes padded up with zeroes
 	if len(cp.carry) > 0 {
-		if 127-len(cp.carry) > 0 {
+		if len(cp.carry) < 127 {
 			cp.carry = append(cp.carry, make([]byte, 127-len(cp.carry))...)
 		}
 		cp.digestLeading127Bytes(cp.carry)
 	}
 
 	// This is how we signal to the bottom of the stack that we are done
-	// which in turn collapses the rest all the way to acc.resultCommP
+	// which in turn collapses the rest all the way to resultCommP
 	close(cp.layerQueues[0])
 
-	paddedPieceSize = ((cp.bytesConsumed + 126) / 127 * 128) // why is 6 afraid of 7...?
-
 	// hacky round-up-to-next-pow2
+	paddedPieceSize = ((cp.bytesConsumed + 126) / 127 * 128) // why is 6 afraid of 7...?
 	if bits.OnesCount64(paddedPieceSize) != 1 {
 		paddedPieceSize = 1 << uint(64-bits.LeadingZeros64(paddedPieceSize))
 	}
@@ -208,9 +215,9 @@ func (cp *Calc) Write(input []byte) (int, error) {
 func (cp *Calc) digestLeading127Bytes(input []byte) {
 
 	// Holds this round's shifts of the original 127 bytes plus the 6 bit overflow
-	// at the end of the expansion cycle. We *do not* reuse the slice: it is being
-	// fed to hash254Into which reuses the slice for the result
-	expander := make([]byte, 128)
+	// at the end of the expansion cycle. We *do not* reuse this array: it is
+	// being fed piece-wise to hash254Into which in turn reuses it for the result
+	var expander [128]byte
 
 	// Cycle over four(4) 31-byte groups, leaving 1 byte in between:
 	// 31 + 1 + 31 + 1 + 31 + 1 + 31 = 127
@@ -219,7 +226,7 @@ func (cp *Calc) digestLeading127Bytes(input []byte) {
 	// Note that copying them into the expansion buffer is mandatory:
 	// we will be feeding it to the workers which reuse the bottom half
 	// of the chunk for the result
-	copy(expander, input[:32])
+	copy(expander[:], input[:32])
 
 	// first 2-bit "shim" forced into the otherwise identical bitstream
 	expander[31] &= 0x3F
@@ -237,7 +244,7 @@ func (cp *Calc) digestLeading127Bytes(input []byte) {
 	expander[63] &= 0x3F
 
 	// ready to dispatch first half
-	cp.layerQueues[0] <- expander[:32]
+	cp.layerQueues[0] <- expander[0:32]
 	cp.layerQueues[0] <- expander[32:64]
 
 	//  In: {{ C[7] C[6] C[5] C[4] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
@@ -259,11 +266,14 @@ func (cp *Calc) digestLeading127Bytes(input []byte) {
 
 	// and dispatch remainder
 	cp.layerQueues[0] <- expander[64:96]
-	cp.layerQueues[0] <- expander[96:]
+	cp.layerQueues[0] <- expander[96:128]
 }
 
 func (cp *Calc) addLayer(myIdx uint) {
 	// the next layer channel, which we might *not* use
+	if cp.layerQueues[myIdx+1] != nil {
+		panic("addLayer called more than once with identical idx argument")
+	}
 	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
 
 	go func() {
@@ -300,7 +310,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 			} else {
 
 				// We are last right now
-				// N.b.: we will not blow out of the preallocated layerQueues array,
+				// n.b. we will not blow out of the preallocated layerQueues array,
 				// as we disallow Write()s above a certain threshhold
 				if cp.layerQueues[myIdx+2] == nil {
 					cp.addLayer(myIdx + 1)
