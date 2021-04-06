@@ -3,7 +3,7 @@ package commp
 import (
 	"bufio"
 	"bytes"
-	"errors"
+	"encoding/base32"
 	"fmt"
 	"io"
 	"os"
@@ -12,15 +12,37 @@ import (
 	"testing"
 
 	randmath "math/rand"
-
-	commcid "github.com/filecoin-project/go-fil-commcid"
-	"github.com/ipfs/go-cid"
 )
 
 type testCase struct {
 	PayloadSize int64
 	PieceSize   uint64
-	PieceCid    cid.Cid
+	RawCommP    []byte
+}
+
+const benchSize = 4 << 20 // MiB
+
+func BenchmarkCommP(b *testing.B) {
+	// reuse both the calculator and reader in every loop
+	// the source is rewound explicitly
+	// the calc is reset implicitly on Digest()
+	src := bytes.NewReader(make([]byte, benchSize))
+	cp := &Calc{}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	b.SetBytes(benchSize)
+	for i := 0; i < b.N; i++ {
+		if _, err := src.Seek(0, 0); err != nil {
+			b.Fatal(err)
+		}
+		if _, err := io.Copy(cp, src); err != nil {
+			b.Fatal(err)
+		}
+		if _, _, err := cp.Digest(); err != nil {
+			b.Fatal(err)
+		}
+	}
 }
 
 func TestCommP(t *testing.T) {
@@ -32,7 +54,7 @@ func TestCommP(t *testing.T) {
 	}
 
 	if testing.Short() {
-		tests = tests[:90]
+		tests = tests[:95]
 	}
 
 	for _, test := range tests {
@@ -155,19 +177,17 @@ func verifyReaderSizeAndCommP(t *testing.T, r io.Reader, test testCase) error {
 	if err != nil {
 		t.Fatal(err)
 	}
-	commCid, err := commcid.DataCommitmentV1ToCID(rawCommP)
-	if err != nil {
-		return err
-	}
 	if paddedSize != test.PieceSize {
-		return errors.New("padded size doesn't match")
+		return fmt.Errorf("produced padded size %d doesn't match expected size %d", paddedSize, test.PieceSize)
 	}
-	if commCid != test.PieceCid {
-		return errors.New("piececid doesn't match")
+	if !bytes.Equal(rawCommP, test.RawCommP) {
+		return fmt.Errorf("produced piececid 0x%X doesn't match expected 0x%X", rawCommP, test.RawCommP)
 	}
 
 	return nil
 }
+
+var b32dec = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
 func getTestCases(path string) ([]testCase, error) {
 	var ret []testCase
@@ -188,14 +208,14 @@ func getTestCases(path string) ([]testCase, error) {
 		if err != nil {
 			return nil, err
 		}
-		pieceCid, err := cid.Decode(parts[2])
+		rawCid, err := b32dec.DecodeString(parts[2][1:]) // [1:] drops the multibase 'b'
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("failed decoding of CID '%s': %s", parts[2][1:], err)
 		}
 		ret = append(ret, testCase{
 			PayloadSize: payloadSize,
 			PieceSize:   pieceSize,
-			PieceCid:    pieceCid,
+			RawCommP:    rawCid[len(rawCid)-32:],
 		})
 	}
 
