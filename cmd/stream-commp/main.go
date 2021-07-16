@@ -149,13 +149,11 @@ func main() {
 	}
 
 	fmt.Fprintf(os.Stderr, `
-CommP:    %x
 CommPCid: %s
-Raw bytes:      % 12d bytes
+Payload:        % 12d bytes
 Unpadded piece: % 12d bytes
 Padded piece:   % 12d bytes
 `,
-		rawCommP,
 		commCid,
 		streamLen,
 		paddedSize/128*127,
