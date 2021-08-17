@@ -1,6 +1,6 @@
 module github.com/filecoin-project/go-fil-commp-hashhash
 
-go 1.11
+go 1.16
 
 require (
 	github.com/minio/sha256-simd v1.0.0
