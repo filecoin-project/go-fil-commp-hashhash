@@ -10,5 +10,3 @@ require (
 	github.com/mattn/go-isatty v0.0.12
 	github.com/pborman/options v1.2.0
 )
-
-replace github.com/filecoin-project/go-fil-commp-hashhash => ../../
