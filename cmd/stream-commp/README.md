@@ -6,7 +6,7 @@ stream-commp
 ## Installation
 
 ```
-go get github.com/filecoin-project/go-fil-commp-hashhash/cmd/stream-commp@latest
+go install github.com/filecoin-project/go-fil-commp-hashhash/cmd/stream-commp@latest
 ```
 
 ## Usage Example
