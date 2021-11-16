@@ -37,10 +37,13 @@ var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
 // MaxLayers is the current maximum height of the rust-fil-proofs proving tree.
 const MaxLayers = uint(31) // result of log2( 64 GiB / 32 )
 
+// MaxPieceSize is the current maximum size of the rust-fil-proofs proving tree.
+const MaxPieceSize = uint64(1 << (MaxLayers + 5))
+
 // MaxPiecePayload is the maximum amount of data that one can Write() to the
 // Calc object, before needing to derive a Digest(). Constrained by the value
 // of MaxLayers.
-const MaxPiecePayload = uint64(127 * (1 << (5 + MaxLayers - 7)))
+const MaxPiecePayload = MaxPieceSize / 128 * 127
 
 // MinPiecePayload is the smallest amount of data for which FR32 padding has
 // a defined result. It is not possible to derive a Digest() before Write()ing
@@ -352,8 +355,8 @@ func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]
 	if sourcePaddedSize < 128 {
 		return nil, xerrors.Errorf("source padded size %d smaller than the minimum of 128 bytes", sourcePaddedSize)
 	}
-	if targetPaddedSize > 1<<(MaxLayers+5) {
-		return nil, xerrors.Errorf("target padded size %d larger than Filecoin maximum of %d bytes", targetPaddedSize, 1<<(MaxLayers+5))
+	if targetPaddedSize > MaxPieceSize {
+		return nil, xerrors.Errorf("target padded size %d larger than Filecoin maximum of %d bytes", targetPaddedSize, MaxPieceSize)
 	}
 
 	// noop
