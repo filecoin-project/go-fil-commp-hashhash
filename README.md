@@ -1,7 +1,7 @@
 go-fil-commp-hashhash
 =======================
 
-> A hash.Hash implementation of [fil-commitment-unsealed](https://github.com/multiformats/multicodec/blob/master/table.csv#L454)
+> A hash.Hash implementation of [fil-commitment-unsealed](https://github.com/multiformats/multicodec/blob/eb94500c/table.csv#L508)
 
 [![GoDoc](https://godoc.org/github.com/thamaraiselvam/github-api-cli?status.svg)](https://pkg.go.dev/github.com/filecoin-project/go-fil-commp-hashhash)
 [![GoReport](https://goreportcard.com/badge/github.com/filecoin-project/go-fil-commp-hashhash)](https://goreportcard.com/report/github.com/filecoin-project/go-fil-commp-hashhash)
