@@ -1,0 +1,15 @@
+name: go-test setup
+description: Set up go-test environment
+
+runs:
+  using: composite
+  steps:
+    - run: |
+        if [[ "$RUNNER_OS" == 'Linux' ]]; then
+          echo 'GOTESTFLAGS=-timeout=30m' >> $GITHUB_ENV
+        else
+          echo "GOTESTFLAGS=$GOTESTFLAGS -short" >> $GITHUB_ENV
+        fi
+        echo "GO386FLAGS=$GO386FLAGS -short" >> $GITHUB_ENV
+        echo "GORACEFLAGS=$GORACEFLAGS -short" >> $GITHUB_ENV
+      shell: bash
