@@ -5,11 +5,9 @@ runs:
   using: composite
   steps:
     - run: |
-        if [[ "$RUNNER_OS" == 'Linux' ]]; then
-          echo 'GOTESTFLAGS=-timeout=1h' >> $GITHUB_ENV
-        else
-          echo "GOTESTFLAGS=$GOTESTFLAGS -short" >> $GITHUB_ENV
-        fi
+        # We could try running full test suite on ubuntu-latest-16-cores
+        # On default runners it takes at least >1h
+        echo "GOTESTFLAGS=$GOTESTFLAGS -short" >> $GITHUB_ENV
         echo "GO386FLAGS=$GO386FLAGS -short" >> $GITHUB_ENV
         echo "GORACEFLAGS=$GORACEFLAGS -short" >> $GITHUB_ENV
       shell: bash

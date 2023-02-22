@@ -4,7 +4,7 @@ go 1.19
 
 require (
 	github.com/filecoin-project/go-fil-commcid v0.1.0
-	github.com/filecoin-project/go-fil-commp-hashhash v0.1.1-0.20210716094257-d9e25dd4bb3d
+	github.com/filecoin-project/go-fil-commp-hashhash v0.1.1-0.20230209104829-259b647a49b0
 	github.com/ipfs/go-cid v0.1.0
 	github.com/ipfs/go-ipld-cbor v0.0.5
 	github.com/mattn/go-isatty v0.0.14
