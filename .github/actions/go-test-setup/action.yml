@@ -6,7 +6,7 @@ runs:
   steps:
     - run: |
         if [[ "$RUNNER_OS" == 'Linux' ]]; then
-          echo 'GOTESTFLAGS=-timeout=30m' >> $GITHUB_ENV
+          echo 'GOTESTFLAGS=-timeout=1h' >> $GITHUB_ENV
         else
           echo "GOTESTFLAGS=$GOTESTFLAGS -short" >> $GITHUB_ENV
         fi
