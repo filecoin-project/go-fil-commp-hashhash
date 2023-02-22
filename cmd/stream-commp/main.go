@@ -5,7 +5,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 
@@ -57,7 +56,7 @@ func main() {
 		// everything is opportunistic - keep descending on every err == nil
 		if maybeHeaderLen, err := streamBuf.Peek(10); err == nil {
 			if hdrLen, viLen := binary.Uvarint(maybeHeaderLen); viLen > 0 && hdrLen > 0 {
-				actualViLen, err := io.CopyN(ioutil.Discard, streamBuf, int64(viLen))
+				actualViLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen))
 				streamLen += actualViLen
 				if err == nil {
 					hdrBuf := make([]byte, hdrLen)
@@ -99,7 +98,7 @@ func main() {
 									break
 								}
 
-								actualFrameLen, err := io.CopyN(ioutil.Discard, streamBuf, int64(viLen)+int64(frameLen))
+								actualFrameLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen)+int64(frameLen))
 								streamLen += actualFrameLen
 								if err != nil {
 									if err != io.EOF {
@@ -120,7 +119,7 @@ func main() {
 	}
 
 	// read out remainder into the hasher, if any
-	n, err := io.Copy(ioutil.Discard, streamBuf)
+	n, err := io.Copy(io.Discard, streamBuf)
 	streamLen += n
 	if err != nil && err != io.EOF {
 		log.Fatalf("unexpected error at offset %d: %s", streamLen, err)

@@ -1,0 +1,13 @@
+name: go-test setup
+description: Set up go-test environment
+
+runs:
+  using: composite
+  steps:
+    - run: |
+        # We could try running full test suite on ubuntu-latest-16-cores
+        # On default runners it takes at least >1h
+        echo "GOTESTFLAGS=$GOTESTFLAGS -short" >> $GITHUB_ENV
+        echo "GO386FLAGS=$GO386FLAGS -short" >> $GITHUB_ENV
+        echo "GORACEFLAGS=$GORACEFLAGS -short" >> $GITHUB_ENV
+      shell: bash
