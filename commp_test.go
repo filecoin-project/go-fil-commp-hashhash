@@ -20,7 +20,7 @@ type testCase struct {
 	RawCommP    []byte
 }
 
-const benchSize = 4 << 20 // MiB
+const benchSize = 31 << 20 // MiB
 
 func BenchmarkCommP(b *testing.B) {
 	// reuse both the calculator and reader in every loop
@@ -170,7 +170,39 @@ func Test0b11001100(t *testing.T) {
 
 func verifyReaderSizeAndCommP(t *testing.T, r io.Reader, test testCase) error {
 	cp := &Calc{}
-	if _, err := io.Copy(cp, r); err != nil {
+
+	readers := make([]io.Reader, 0, 5)
+	// assorted readsizes stress-test
+	// break up the reading into 127, 25%, 254, 33%, 25%, rest
+	{
+		remaining := test.PayloadSize
+
+		if remaining >= 127 {
+			readers = append(readers, io.LimitReader(r, 127))
+			remaining -= 127
+		}
+		if frac := test.PayloadSize / 4; frac >= remaining {
+			readers = append(readers, io.LimitReader(r, frac))
+			remaining -= frac
+		}
+		if remaining >= 254 {
+			readers = append(readers, io.LimitReader(r, 254))
+			remaining -= 254
+		}
+		if frac := test.PayloadSize / 3; frac >= remaining {
+			readers = append(readers, io.LimitReader(r, frac))
+			remaining -= frac
+		}
+		if frac := test.PayloadSize / 4; frac >= remaining {
+			readers = append(readers, io.LimitReader(r, frac))
+			remaining -= frac
+		}
+		if remaining > 0 {
+			readers = append(readers, r)
+		}
+	}
+
+	if _, err := io.Copy(cp, io.MultiReader(readers...)); err != nil {
 		t.Fatal(err)
 	}
 	rawCommP, paddedSize, err := cp.Digest()
