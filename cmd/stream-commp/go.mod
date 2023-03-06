@@ -27,7 +27,7 @@ require (
 	github.com/pborman/getopt/v2 v2.0.0-20200816005738-fd0d075bf4de // indirect
 	github.com/polydawn/refmt v0.0.0-20190221155625-df39d6c2d992 // indirect
 	github.com/whyrusleeping/cbor-gen v0.0.0-20200123233031-1cdf64d27158 // indirect
-	golang.org/x/crypto v0.0.0-20210506145944-38f3c27a63bf // indirect
+	golang.org/x/crypto v0.1.0 // indirect
 	golang.org/x/sys v0.6.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 )
