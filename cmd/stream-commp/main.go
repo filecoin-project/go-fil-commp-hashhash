@@ -16,21 +16,12 @@ import (
 	"github.com/pborman/options"
 )
 
-type CarHeader struct {
-	Roots   []cid.Cid
-	Version uint64
-}
-
-func init() {
-	cbor.RegisterCborType(CarHeader{})
-}
-
 const BufSize = ((4 << 20) / 128 * 127)
 
 func main() {
 
 	opts := &struct {
-		DisableStreamScan bool         `getopt:"-d --disable-stream-scan If set do not try to scan the contents of the stream for a potential .car stream (much faster)"`
+		DisableStreamScan bool         `getopt:"-d --disable-stream-scan If set do not try to scan the contents of the stream for a potential .car stream"`
 		PadPieceSize      uint64       `getopt:"-p --pad-piece-size      Optional target power-of-two piece size, larger than the original input, one would like to pad to"`
 		Help              options.Help `getopt:"-h --help                Display help"`
 	}{}
@@ -47,78 +38,16 @@ func main() {
 		BufSize,
 	)
 
-	var streamLen, blockCount int64
-	var brokenCar bool
-	var carHdr *CarHeader
+	var streamLen int64
 
+	var readRes string
 	if !opts.DisableStreamScan {
-		// pretend the stream is a car and try to parse it
-		// everything is opportunistic - keep descending on every err == nil
-		if maybeHeaderLen, err := streamBuf.Peek(10); err == nil {
-			if hdrLen, viLen := binary.Uvarint(maybeHeaderLen); viLen > 0 && hdrLen > 0 {
-				actualViLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen))
-				streamLen += actualViLen
-				if err == nil {
-					hdrBuf := make([]byte, hdrLen)
-					actualHdrLen, err := io.ReadFull(streamBuf, hdrBuf)
-					streamLen += int64(actualHdrLen)
-					if err == nil {
-						carHdr = new(CarHeader)
-						if cbor.DecodeInto(hdrBuf, carHdr) != nil {
-							// if it fails - it fails
-							carHdr = nil
-						} else if carHdr.Version == 1 {
-							//
-							// I know how to decode this!
-							// Warn if we find broken .car-parts
-							//
-							for {
-								maybeNextFrameLen, err := streamBuf.Peek(10)
-								if err == io.EOF {
-									break
-								}
-								if err != nil && err != bufio.ErrBufferFull {
-									log.Fatalf("unexpected error at offset %d: %s", streamLen, err)
-								}
-								if len(maybeNextFrameLen) == 0 {
-									log.Fatalf("impossible 0-length peek without io.EOF at offset %d", streamLen)
-								}
-
-								frameLen, viLen := binary.Uvarint(maybeNextFrameLen)
-								if viLen <= 0 {
-									// car file with trailing garbage behind it
-									log.Printf("aborting car stream parse: undecodeable varint at offset %d", streamLen)
-									brokenCar = true
-									break
-								}
-								if frameLen > 2<<20 {
-									// anything over ~2MiB got to be a mistake
-									log.Printf("aborting car stream parse: unexpectedly large frame length of %d bytes at offset %d", frameLen, streamLen)
-									brokenCar = true
-									break
-								}
-
-								actualFrameLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen)+int64(frameLen))
-								streamLen += actualFrameLen
-								if err != nil {
-									if err != io.EOF {
-										log.Fatalf("unexpected error at offset %d: %s", streamLen-actualFrameLen, err)
-									}
-									log.Printf("aborting car stream parse: truncated frame at offset %d: expected %d bytes but read %d: %s", streamLen-actualFrameLen, frameLen, actualFrameLen, err)
-									brokenCar = true
-									break
-								}
-								blockCount++
-							}
-						}
-					}
-				}
-			}
-		}
-		// end of "pretend the stream is a car"
+		var n int64
+		n, readRes = scanInputStream(streamBuf)
+		streamLen += n
 	}
 
-	// read out remainder into the hasher, if any
+	// read out remainder from above into the hasher, if any
 	n, err := io.Copy(io.Discard, streamBuf)
 	streamLen += n
 	if err != nil && err != io.EOF {
@@ -159,37 +88,91 @@ Padded piece:   % 12d bytes
 		paddedSize,
 	)
 
-	// we got a header, funny that!
-	if carHdr != nil {
+	if readRes != "" {
+		fmt.Fprintf(os.Stderr, "\n%s\n\n", readRes)
+	}
+}
 
-		var maybeInvalidText string
-		if brokenCar {
-			maybeInvalidText = "*CORRUPTED* "
-		}
+type CarHeader struct {
+	Roots   []cid.Cid
+	Version uint64
+}
 
-		rootsText := make([]byte, 0, 2048)
+func scanInputStream(streamBuf *bufio.Reader) (cnt int64, res string) {
 
-		if len(carHdr.Roots) > 0 {
-			// rootsText = append(rootsText, '\n')
-			for i, c := range carHdr.Roots {
-				rootsText = append(
-					rootsText,
-					fmt.Sprintf("% 5d: %s\n", i+1, c.String())...,
-				)
+	cbor.RegisterCborType(CarHeader{})
+
+	// pretend the stream is a car and try to parse it
+	// everything is opportunistic - keep descending on every err == nil
+	if maybeHeaderLen, err := streamBuf.Peek(10); err == nil {
+
+		if hdrLen, viLen := binary.Uvarint(maybeHeaderLen); viLen > 0 && hdrLen > 0 {
+			actualViLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen))
+			cnt += actualViLen
+			if err == nil {
+
+				hdrBuf := make([]byte, hdrLen)
+				actualHdrLen, err := io.ReadFull(streamBuf, hdrBuf)
+				cnt += int64(actualHdrLen)
+
+				if err == nil {
+
+					carHdr := new(CarHeader)
+					if cbor.DecodeInto(hdrBuf, carHdr) != nil {
+						return
+					}
+
+					if carHdr.Version != 1 {
+						log.Printf("detected a CARv%d header: using the CommP of such an input is almost certainly a mistake", carHdr.Version)
+						res = fmt.Sprintf("*UNEXPECTED* CARv%d detected in stream", carHdr.Version)
+						return
+					}
+
+					//
+					// Assume CARv1: I know how to decode this!
+					// Check the *first* block only, if any at all
+					//
+					maybeNextFrameLen, err := streamBuf.Peek(10)
+					if err == io.EOF {
+						res = "CARv1 detected in stream"
+						return
+					}
+
+					if err != nil && err != bufio.ErrBufferFull {
+						log.Fatalf("unexpected read error at offset %d: %s", cnt, err)
+						return
+					}
+
+					// from here on assume everything is malformed, unless we say otherwise
+					res = "*MALFORMED* CARv1 detected in stream"
+
+					if len(maybeNextFrameLen) == 0 {
+						log.Fatalf("impossible 0-length peek without io.EOF at offset %d", cnt)
+						return
+					}
+
+					frameLen, viLen := binary.Uvarint(maybeNextFrameLen)
+					if viLen <= 0 {
+						// car file with trailing garbage behind it
+						log.Printf("aborting car stream parse: undecodeable varint at offset %d", cnt)
+						return
+					}
+
+					actualFrameLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen)+int64(frameLen))
+					cnt += actualFrameLen
+					if err != nil {
+						if err != io.EOF {
+							log.Fatalf("unexpected error at offset %d: %s", cnt-actualFrameLen, err)
+						}
+						log.Printf("aborting car stream parse: truncated frame at offset %d: expected %d bytes but read %d: %s", cnt-actualFrameLen, frameLen, actualFrameLen, err)
+						return
+					}
+
+					// all looks healthy
+					res = "CARv1 detected in stream"
+				}
 			}
 		}
-
-		fmt.Fprintf(os.Stderr, `
-%sCARv%d detected in stream:
-Blocks:  % 8d
-Roots:   % 8d
-%s
-`,
-			maybeInvalidText,
-			carHdr.Version,
-			blockCount,
-			len(carHdr.Roots),
-			rootsText,
-		)
 	}
+	return
 }
