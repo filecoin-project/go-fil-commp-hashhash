@@ -58,13 +58,12 @@ const (
 
 var (
 	layerQueueDepth   = 32 // FIXME: tune better, chosen by rough experiment
-	shaPool           = sync.Pool{New: func() interface{} { return sha256simd.New() }}
 	stackedNulPadding [MaxLayers][]byte
 )
 
 // initialize the nul padding stack (cheap to do upfront, just MaxLayers loops)
 func init() {
-	h := shaPool.Get().(hash.Hash)
+	h := sha256simd.New()
 
 	stackedNulPadding[0] = make([]byte, commpDigestSize)
 	for i := uint(1); i < MaxLayers; i++ {
@@ -74,8 +73,6 @@ func init() {
 		stackedNulPadding[i] = h.Sum(make([]byte, 0, commpDigestSize))
 		stackedNulPadding[i][31] &= 0x3F
 	}
-
-	shaPool.Put(h)
 }
 
 // BlockSize is the amount of bytes consumed by the commP algorithm in one go.
@@ -213,6 +210,7 @@ func (cp *Calc) Write(input []byte) (int, error) {
 		cp.buffer = cp.buffer[:0]
 	}
 
+	// FIXME: suboptimal, limits each slab to a buffer size, but could go exponentially larger
 	for len(input) >= bufferSize {
 		cp.digestQuads(input[:bufferSize])
 		input = input[bufferSize:]
@@ -287,6 +285,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
 
 	go func() {
+		s256 := sha256simd.New()
 		var twinHold []byte
 
 		for {
@@ -304,7 +303,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 				if twinHold != nil {
 					copy(twinHold[32:64], stackedNulPadding[myIdx])
-					cp.hashSlab254(0, twinHold[0:64])
+					cp.hashSlab254(s256, 0, twinHold[0:64])
 					cp.layerQueues[myIdx+1] <- twinHold[0:64:64]
 				}
 
@@ -317,12 +316,12 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 			switch {
 			case len(slab) > 1<<(5+myIdx):
-				cp.hashSlab254(myIdx, slab)
+				cp.hashSlab254(s256, myIdx, slab)
 				cp.layerQueues[myIdx+1] <- slab
 				pushedWork = true
 			case twinHold != nil:
 				copy(twinHold[32:64], slab[0:32])
-				cp.hashSlab254(0, twinHold[0:64])
+				cp.hashSlab254(s256, 0, twinHold[0:64])
 				cp.layerQueues[myIdx+1] <- twinHold[0:32:64]
 				pushedWork = true
 				twinHold = nil
@@ -341,9 +340,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 	}()
 }
 
-func (cp *Calc) hashSlab254(layerIdx uint, slab []byte) {
-	h := shaPool.Get().(hash.Hash)
-
+func (cp *Calc) hashSlab254(h hash.Hash, layerIdx uint, slab []byte) {
 	stride := 1 << (5 + layerIdx)
 	for i := 0; len(slab) > i+stride; i += 2 * stride {
 		h.Reset()
@@ -351,8 +348,6 @@ func (cp *Calc) hashSlab254(layerIdx uint, slab []byte) {
 		h.Write(slab[i+stride : 32+i+stride])
 		h.Sum(slab[i:i])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
 	}
-
-	shaPool.Put(h)
 }
 
 // PadCommP is experimental, do not use it.
@@ -388,7 +383,7 @@ func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]
 	s := bits.TrailingZeros64(sourcePaddedSize)
 	t := bits.TrailingZeros64(targetPaddedSize)
 
-	h := shaPool.Get().(hash.Hash)
+	h := sha256simd.New()
 	for ; s < t; s++ {
 		h.Reset()
 		h.Write(out)
@@ -396,7 +391,6 @@ func PadCommP(sourceCommP []byte, sourcePaddedSize, targetPaddedSize uint64) ([]
 		out = h.Sum(out[:0])
 		out[31] &= 0x3F
 	}
-	shaPool.Put(h)
 
 	return out, nil
 }
