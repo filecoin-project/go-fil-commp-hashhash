@@ -18,6 +18,8 @@ import (
 
 const BufSize = ((16 << 20) / 128 * 127)
 
+var ioOptimizations []func(os.FileInfo, *os.File) error
+
 func main() {
 
 	opts := &struct {
@@ -25,16 +27,19 @@ func main() {
 		PadPieceSize      uint64       `getopt:"-p --pad-piece-size      Optional target power-of-two piece size, larger than the original input, one would like to pad to"`
 		Help              options.Help `getopt:"-h --help                Display help"`
 	}{}
-
 	options.RegisterAndParse(opts)
 
-	if isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd()) {
-		log.Println("Reading from STDIN...")
+	inputFH := os.Stdin
+
+	if isatty.IsTerminal(inputFH.Fd()) || isatty.IsCygwinTerminal(inputFH.Fd()) {
+		log.Println("Reading from the TTY...")
+	} else if err := optimizeIO(inputFH); err != nil {
+		log.Printf("unexpected failure to optimize input: %s", err)
 	}
 
 	cp := new(commp.Calc)
 	streamBuf := bufio.NewReaderSize(
-		io.TeeReader(os.Stdin, cp),
+		io.TeeReader(inputFH, cp),
 		BufSize,
 	)
 
@@ -174,6 +179,21 @@ func scanInputStream(streamBuf *bufio.Reader) (cnt int64, res string) {
 		}
 	}
 	return
+}
+
+func optimizeIO(fh *os.File) error {
+	st, err := fh.Stat()
+	if err != nil {
+		return err
+	}
+
+	for _, f := range ioOptimizations {
+		if err := f(st, fh); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // Using io.Discard in the various Copy() invocations above results in invoking
