@@ -312,28 +312,26 @@ func (cp *Calc) addLayer(myIdx uint) {
 				return
 			}
 
-			var pushedWork bool
-
 			switch {
 			case len(slab) > 1<<(5+myIdx):
 				cp.hashSlab254(s256, myIdx, slab)
 				cp.layerQueues[myIdx+1] <- slab
-				pushedWork = true
 			case twinHold != nil:
 				copy(twinHold[32:64], slab[0:32])
 				cp.hashSlab254(s256, 0, twinHold[0:64])
 				cp.layerQueues[myIdx+1] <- twinHold[0:32:64]
-				pushedWork = true
 				twinHold = nil
 			default:
 				twinHold = slab[0:32:64]
+				// avoid code below
+				continue
 			}
 
-			// Check whether we need another worker
+			// Check whether we need another worker for what we just pushed
 			//
 			// n.b. we will not blow out of the preallocated layerQueues array,
 			// as we disallow Write()s above a certain threshold
-			if pushedWork && cp.layerQueues[myIdx+2] == nil {
+			if cp.layerQueues[myIdx+2] == nil {
 				cp.addLayer(myIdx + 1)
 			}
 		}
