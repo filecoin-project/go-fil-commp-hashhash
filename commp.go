@@ -52,7 +52,7 @@ const MinPiecePayload = uint64(65)
 
 const (
 	commpDigestSize = sha256simd.Size
-	quadPayload     = 127
+	quadPayload     = int(127)
 	bufferSize      = 256 * quadPayload // FIXME: tune better, chosen by rough experiment
 )
 
@@ -127,7 +127,7 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 		cp.mu.Unlock()
 	}()
 
-	if processed := cp.quadsEnqueued*quadPayload + uint64(len(cp.buffer)); processed < MinPiecePayload {
+	if processed := cp.quadsEnqueued*uint64(quadPayload) + uint64(len(cp.buffer)); processed < MinPiecePayload {
 		err = xerrors.Errorf(
 			"insufficient state accumulated: commP is not defined for inputs shorter than %d bytes, but only %d processed so far",
 			MinPiecePayload, processed,
@@ -178,7 +178,7 @@ func (cp *Calc) Write(input []byte) (int, error) {
 	defer cp.mu.Unlock()
 
 	if MaxPiecePayload <
-		(cp.quadsEnqueued*quadPayload)+
+		(cp.quadsEnqueued*uint64(quadPayload))+
 			uint64(len(input)) {
 		return 0, xerrors.Errorf(
 			"writing additional %d bytes to the accumulator would overflow the maximum supported unpadded piece size %d",
@@ -313,7 +313,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 			}
 
 			switch {
-			case len(slab) > 1<<(5+myIdx):
+			case uint64(len(slab)) > uint64(1<<(5+myIdx)): // uint64 cast needed on 32-bit systems
 				cp.hashSlab254(s256, myIdx, slab)
 				cp.layerQueues[myIdx+1] <- slab
 			case twinHold != nil:
