@@ -16,7 +16,7 @@ import (
 	"github.com/pborman/options"
 )
 
-const BufSize = ((4 << 20) / 128 * 127)
+const BufSize = ((16 << 20) / 128 * 127)
 
 func main() {
 
@@ -46,9 +46,8 @@ func main() {
 		n, readRes = scanInputStream(streamBuf)
 		streamLen += n
 	}
-
 	// read out remainder from above into the hasher, if any
-	n, err := io.Copy(io.Discard, streamBuf)
+	n, err := io.Copy(uDiscard, streamBuf)
 	streamLen += n
 	if err != nil && err != io.EOF {
 		log.Fatalf("unexpected error at offset %d: %s", streamLen, err)
@@ -107,7 +106,7 @@ func scanInputStream(streamBuf *bufio.Reader) (cnt int64, res string) {
 	if maybeHeaderLen, err := streamBuf.Peek(10); err == nil {
 
 		if hdrLen, viLen := binary.Uvarint(maybeHeaderLen); viLen > 0 && hdrLen > 0 {
-			actualViLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen))
+			actualViLen, err := io.CopyN(uDiscard, streamBuf, int64(viLen))
 			cnt += actualViLen
 			if err == nil {
 
@@ -158,7 +157,7 @@ func scanInputStream(streamBuf *bufio.Reader) (cnt int64, res string) {
 						return
 					}
 
-					actualFrameLen, err := io.CopyN(io.Discard, streamBuf, int64(viLen)+int64(frameLen))
+					actualFrameLen, err := io.CopyN(uDiscard, streamBuf, int64(viLen)+int64(frameLen))
 					cnt += actualFrameLen
 					if err != nil {
 						if err != io.EOF {
@@ -176,3 +175,16 @@ func scanInputStream(streamBuf *bufio.Reader) (cnt int64, res string) {
 	}
 	return
 }
+
+// Using io.Discard in the various Copy() invocations above results in invoking
+// https://cs.opensource.google/go/go/+/refs/tags/go1.20.7:src/io/io.go;l=647-661
+// which in turn is bound by this limit:
+// https://cs.opensource.google/go/go/+/refs/tags/go1.20.7:src/io/io.go;l=642
+// resulting in micro-writes into the hasher
+// Use a dumb discarder instead
+type unsmartDiscard struct{}
+
+var uDiscard io.Writer = unsmartDiscard{}
+
+func (unsmartDiscard) Write(p []byte) (int, error)       { return len(p), nil }
+func (unsmartDiscard) WriteString(s string) (int, error) { return len(s), nil }
