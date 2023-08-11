@@ -9,5 +9,5 @@ runs:
         # On default runners it takes at least >1h
         echo "GOTESTFLAGS=$GOTESTFLAGS -short" >> $GITHUB_ENV
         echo "GO386FLAGS=$GO386FLAGS -short" >> $GITHUB_ENV
-        echo "GORACEFLAGS=$GORACEFLAGS -short" >> $GITHUB_ENV
+        echo "GORACEFLAGS=$GORACEFLAGS -short -timeout=30m" >> $GITHUB_ENV
       shell: bash
