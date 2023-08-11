@@ -4,11 +4,12 @@ go 1.19
 
 require (
 	github.com/filecoin-project/go-fil-commcid v0.1.0
-	github.com/filecoin-project/go-fil-commp-hashhash v0.2.0
+	github.com/filecoin-project/go-fil-commp-hashhash v0.2.1-0.20230807110556-86d57f8d8427
 	github.com/ipfs/go-cid v0.3.2
 	github.com/ipfs/go-ipld-cbor v0.0.6
 	github.com/mattn/go-isatty v0.0.17
 	github.com/pborman/options v1.3.0
+	golang.org/x/sys v0.6.0
 )
 
 require (
@@ -29,7 +30,6 @@ require (
 	github.com/spaolacci/murmur3 v1.1.0 // indirect
 	github.com/whyrusleeping/cbor-gen v0.0.0-20230126041949-52956bd4c9aa // indirect
 	golang.org/x/crypto v0.7.0 // indirect
-	golang.org/x/sys v0.6.0 // indirect
 	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2 // indirect
 	lukechampine.com/blake3 v1.1.7 // indirect
 )

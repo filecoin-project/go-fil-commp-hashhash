@@ -23,11 +23,7 @@ Payload:                6896 bytes
 Unpadded piece:         8128 bytes
 Padded piece:           8192 bytes
 
-CARv1 detected in stream:
-Blocks:         8
-Roots:          1
-    1: bafybeia6po64b6tfqq73lckadrhpihg2oubaxgqaoushquhcek46y3zumm
-
+CARv1 detected in stream
 ```
 
 ## License
