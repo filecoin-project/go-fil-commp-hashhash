@@ -48,13 +48,9 @@ func BenchmarkCommP(b *testing.B) {
 func TestCommP(t *testing.T) {
 	t.Parallel()
 
-	tests, err := getTestCases("testdata/random.txt")
+	tests, err := getTestCases("testdata/random.txt", testing.Short())
 	if err != nil {
 		t.Fatal(err)
-	}
-
-	if testing.Short() {
-		tests = tests[:95]
 	}
 
 	for _, test := range tests {
@@ -131,7 +127,7 @@ func (rr *repeatedReader) Read(p []byte) (n int, err error) {
 func TestZero(t *testing.T) {
 	t.Parallel()
 
-	tests, err := getTestCases("testdata/zero.txt")
+	tests, err := getTestCases("testdata/zero.txt", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +147,7 @@ func TestZero(t *testing.T) {
 func Test0b11001100(t *testing.T) {
 	t.Parallel()
 
-	tests, err := getTestCases("testdata/0xCC.txt")
+	tests, err := getTestCases("testdata/0xCC.txt", false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -221,7 +217,7 @@ func verifyReaderSizeAndCommP(t *testing.T, r io.Reader, test testCase) error {
 
 var b32dec = base32.NewEncoding("abcdefghijklmnopqrstuvwxyz234567").WithPadding(base32.NoPadding)
 
-func getTestCases(path string) ([]testCase, error) {
+func getTestCases(path string, shortOnly bool) ([]testCase, error) {
 	var ret []testCase
 	f, err := os.Open(path)
 	if err != nil {
@@ -236,6 +232,11 @@ func getTestCases(path string) ([]testCase, error) {
 		if err != nil {
 			return nil, err
 		}
+
+		if shortOnly && payloadSize > 1<<30 {
+			continue
+		}
+
 		pieceSize, err := strconv.ParseUint(parts[1], 10, 64)
 		if err != nil {
 			return nil, err
