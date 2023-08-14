@@ -1,6 +1,6 @@
 module github.com/filecoin-project/go-fil-commp-hashhash/cmd/stream-commp
 
-go 1.19
+go 1.20
 
 require (
 	github.com/filecoin-project/go-fil-commcid v0.1.0
