@@ -110,7 +110,72 @@ func TestCommP(t *testing.T) {
 			}
 		})
 	}
+}
+func TestCommPMarshalUnmarshal(t *testing.T) {
+	//t.Parallel()
 
+	tests, err := getTestCases("testdata/random.txt", testing.Short())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("%d", test.PayloadSize), func(t *testing.T) {
+			//t.Parallel()
+			pr, pw := io.Pipe()
+			var randErr error
+			go func() {
+				defer pw.Close()
+
+				// This go-routine logic is the same as in
+				// jbenet/go-random. It's copied here to allow doing
+				// parallel tests, since that library uses a singleton seed
+				// for the random source.
+				//
+				// Recall that go-random is used to deterministically generate
+				// the data in Lotus or any other source of truth for these
+				// tests. So it's important to have the same logic here for
+				// deterministic data generation.
+				rand := randmath.New(randmath.NewSource(1337))
+
+				bufsize := int64(1024 * 1024 * 4)
+				b := make([]byte, bufsize)
+
+				count := test.PayloadSize
+				for count > 0 {
+					if bufsize > count {
+						bufsize = count
+						b = b[:bufsize]
+					}
+
+					var n uint32
+					for i := int64(0); i < bufsize; {
+						n = rand.Uint32()
+						for j := 0; j < 4 && i < bufsize; j++ {
+							b[i] = byte(n & 0xff)
+							n >>= 8
+							i++
+						}
+					}
+					count = count - bufsize
+
+					r := bytes.NewReader(b)
+					_, err := io.Copy(pw, r)
+					if err != nil {
+						randErr = err
+						return
+					}
+				}
+			}()
+			if err := verifyReaderSizeAndCommPMarshalUnmarshal(t, pr, test); err != nil {
+				t.Fatal(err)
+			}
+			if randErr != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
 
 type repeatedReader struct {
@@ -212,6 +277,68 @@ func verifyReaderSizeAndCommP(t *testing.T, r io.Reader, test testCase) error {
 		return fmt.Errorf("produced piececid 0x%X doesn't match expected 0x%X", rawCommP, test.RawCommP)
 	}
 
+	return nil
+}
+
+func verifyReaderSizeAndCommPMarshalUnmarshal(t *testing.T, r io.Reader, test testCase) error {
+	cp := &Calc{}
+
+	readers := make([]io.Reader, 0, 5)
+	// assorted readsizes stress-test
+	// break up the reading into 127, 25%, 254, 33%, 25%, rest
+	{
+		remaining := test.PayloadSize
+
+		if remaining >= 127 {
+			readers = append(readers, io.LimitReader(r, 127))
+			remaining -= 127
+		}
+		if frac := test.PayloadSize / 4; frac >= remaining {
+			readers = append(readers, io.LimitReader(r, frac))
+			remaining -= frac
+		}
+		if remaining >= 254 {
+			readers = append(readers, io.LimitReader(r, 254))
+			remaining -= 254
+		}
+		if frac := test.PayloadSize / 3; frac >= remaining {
+			readers = append(readers, io.LimitReader(r, frac))
+			remaining -= frac
+		}
+		if frac := test.PayloadSize / 4; frac >= remaining {
+			readers = append(readers, io.LimitReader(r, frac))
+			remaining -= frac
+		}
+		if remaining > 0 {
+			readers = append(readers, r)
+		}
+	}
+
+	for _, reader := range readers {
+		if _, err := io.Copy(cp, reader); err != nil {
+			t.Fatal(err)
+		}
+		state, err := cp.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cp.Reset()
+		newCP := &Calc{}
+		if err := newCP.UnmarshalBinary(state); err != nil {
+			t.Fatal(err)
+		}
+		cp = newCP
+	}
+	rawCommP, paddedSize, err := cp.Digest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if paddedSize != test.PieceSize {
+		return fmt.Errorf("produced padded size %d doesn't match expected size %d", paddedSize, test.PieceSize)
+	}
+	if !bytes.Equal(rawCommP, test.RawCommP) {
+		return fmt.Errorf("produced piececid 0x%X doesn't match expected 0x%X", rawCommP, test.RawCommP)
+	}
 	return nil
 }
 
