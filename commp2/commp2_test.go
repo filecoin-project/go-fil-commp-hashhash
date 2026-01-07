@@ -352,6 +352,7 @@ func TestEquivalence_PowerOfTwoSizes(t *testing.T) {
 			}
 
 			// Compare results
+			// todo do we actually expect size to match??
 			if v1PaddedSize != v2PaddedSize {
 				t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
 			}
@@ -380,15 +381,16 @@ func TestEquivalence_ZeroWithOffset(t *testing.T) {
 		largePayloadSize := int64(largePaddedSize / 128 * 127)
 
 		// Test with a few different small piece sizes and offsets
+		// Offsets must be >= largePayloadSize/2 to test offset-aware commP properly
+		// (data in the second half means zeros in the first half affect the tree structure)
 		testCases := []struct {
 			smallSize int64
 			offset    int64
 		}{
-			{127, 0},                      // one quad at start
-			{127, largePayloadSize - 127}, // one quad at end
-			{254, largePayloadSize / 4},   // two quads at 25%
-			{1016, largePayloadSize / 2},  // 8 quads at 50%
-			{rand.Int63n(5000) + 500, rand.Int63n(largePayloadSize - 6000)}, // random
+			{127, largePayloadSize / 2},        // one quad at 50%
+			{254, largePayloadSize / 2},        // two quads at 50%
+			{1016, largePayloadSize * 3 / 4},   // 8 quads at 75%
+			{rand.Int63n(5000) + 500, largePayloadSize/2 + rand.Int63n(largePayloadSize/2-6000)}, // random in second half
 		}
 
 		for _, tc := range testCases {

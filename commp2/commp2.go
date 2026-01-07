@@ -5,6 +5,7 @@ package commp2
 
 import (
 	"hash"
+	"math/bits"
 	"runtime"
 	"sync"
 
@@ -48,15 +49,17 @@ type subgraph struct {
 	lastLeaf  uint64
 
 	// nodes computed up to the right side of their parent
-	// rightOnLeft[level] is valid if the first node at this level is a right child
+	// rightOnLeft[level] is valid if the **first** node at this level is a right child
 	// whose left sibling is in a previous chunk
-	rightOnLeft [MaxLayers][commpDigestSize]byte
-	rightValid  [MaxLayers]bool
+	rightOnLeft    [MaxLayers][commpDigestSize]byte
+	rightOnLeftIdx [MaxLayers]uint64 // node index of rightOnLeft[level]
+	rightValid     [MaxLayers]bool
 
 	// nodes on the left side of their parent
-	// left[level] is valid if the last node at this level is a left child
+	// left[level] is valid if the **last** node at this level is a left child
 	// whose right sibling is in a future chunk
 	left      [MaxLayers][commpDigestSize]byte
+	leftIdx   [MaxLayers]uint64 // node index of left[level]
 	leftValid [MaxLayers]bool
 }
 
@@ -110,10 +113,15 @@ func (cp *Calc) Reset() {
 	cp.totalLeaves = 0
 }
 
+// BeginAt sets the byte offset where the data will be placed in the virtual piece.
+// This enables computing CommP for data at an arbitrary offset, where all bytes
+// before the offset are treated as zeros.
+//
+// Example: BeginAt(65024) followed by Write(127 bytes) computes the same CommP
+// as if you had written 65024 zero bytes followed by 127 bytes of data.
+//
+// The resulting commitment can be used for inclusion proofs in larger aggregated pieces.
 func (cp *Calc) BeginAt(bytePosition uint64) error {
-	if bytePosition != 0 {
-		return xerrors.Errorf("bytePosition must be 0")
-	}
 	cp.bufStartOffset = bytePosition
 	return nil
 }
@@ -229,6 +237,7 @@ func (cp *Calc) processBuffer(isLastBuffer bool) (int, error) {
 		// pending holds the last unpaired "left" node at each level computed within this chunk.
 		// Anything that remains pending after processing becomes sg.left[level] for stitching.
 		var pending [MaxLayers][commpDigestSize]byte
+		var pendingIdx [MaxLayers]uint64 // node index of pending[level]
 		var pendingValid [MaxLayers]bool
 
 		// reduce combines a node into the tree at the given level.
@@ -243,6 +252,7 @@ func (cp *Calc) processBuffer(isLastBuffer bool) (int, error) {
 			if isLeft(nodeIdx) {
 				// On the left, store and wait for right sibling (within this chunk)
 				copy(pending[level][:], data[:])
+				pendingIdx[level] = nodeIdx
 				pendingValid[level] = true
 			} else {
 				// On the right: if we have a pending left at this level, combine.
@@ -260,6 +270,7 @@ func (cp *Calc) processBuffer(isLastBuffer bool) (int, error) {
 					reduce(level+1, nodeIdx/2, &parentHash)
 				} else {
 					copy(sg.rightOnLeft[level][:], data[:])
+					sg.rightOnLeftIdx[level] = nodeIdx
 					sg.rightValid[level] = true
 				}
 			}
@@ -293,6 +304,7 @@ func (cp *Calc) processBuffer(isLastBuffer bool) (int, error) {
 		for level := 0; level < int(MaxLayers); level++ {
 			if pendingValid[level] {
 				copy(sg.left[level][:], pending[level][:])
+				sg.leftIdx[level] = pendingIdx[level]
 				sg.leftValid[level] = true
 			}
 		}
@@ -463,151 +475,181 @@ func (cp *Calc) targetBufSize() int {
 
 // stitchTrees combines all subgraphs and computes the final root hash.
 // It processes subgraphs in order, stitching rightOnLeft from chunk N
-// with left from chunk N+1, and filling missing siblings with zero padding.
+// with left from chunk N-1, and filling missing siblings with zero padding.
+//
+// Tree structure for stitching (example with 16 leaves in 2 chunks of 8):
+//
+//                          ROOT (level 4)
+//                         /              \
+//                        /                \
+//              [level 3]                  [level 3]
+//               chunk0                     chunk1
+//              root(0-7)                  root(8-15)
+//              /      \                   /        \
+//          [lvl2]   [lvl2]           [lvl2]     [lvl2]
+//          /   \    /   \            /   \       /   \
+//       [lvl1] ... ...  ...       [lvl1] ...   ...  ...
+//
+// When chunks are processed separately:
+// - Chunk 0 computes its internal tree, leaves root(0-7) in left[3]
+// - Chunk 1 computes its internal tree, has root(8-15) as rightOnLeft[3]
+//   (because at level 3, node index 1 is a right child needing left sibling)
+//
+// Stitching combines these boundary nodes:
+// - pending[3] = root(0-7) from chunk 0
+// - rightOnLeft[3] = root(8-15) from chunk 1
+// - combine them → final ROOT
+//
+// For padding to power-of-2 (e.g., 5 leaves → pad to 8):
+//
+//                    ROOT (level 3)
+//                   /              \
+//             nodeA                nodeB
+//            (0-3)              (4-7, partially zero)
+//           /     \              /        \
+//        node01  node23     node45      zeroNode
+//        /  \    /  \       /   \        /     \
+//       0   1   2   3      4   zero   zero   zero
+//
+// - Chunk processes leaves 0-4
+// - left[0] = leaf4 (index 4, left child waiting for right sibling)
+// - left[2] = nodeA (from combining 0-3)
+// - Finalization: pad leaf4 with zero → node45, then pad with zeroNode → nodeB
+// - Combine nodeA + nodeB → ROOT
 func (cp *Calc) stitchTrees() [commpDigestSize]byte {
-	h := sha256simd.New()
-
-	// Calculate the tree height: for N leaves, we need log2(nextPow2(N)) levels
-	// The root is at level treeHeight
-	paddedLeaves := nextPow2(cp.totalLeaves)
-	treeHeight := 0
-	for (uint64(1) << treeHeight) < paddedLeaves {
-		treeHeight++
+	if len(cp.subgraphs) == 0 {
+		var zero [commpDigestSize]byte
+		return zero
 	}
 
-	// Accumulated state: for each level, track the "carry" node
-	// that needs to be combined with the next chunk's contribution
-	var carry [MaxLayers][commpDigestSize]byte
-	var carryValid [MaxLayers]bool
+	// Calculate the target root level based on totalLeaves padded to power of 2
+	// For n leaves, the tree has ceil(log2(n)) levels above the leaves
+	// bits.Len64(n-1) gives us the number of bits needed, which equals the tree height
+	paddedLeaves := nextPow2(cp.totalLeaves)
+	rootLevel := bits.Len64(paddedLeaves) - 1 // e.g., 8 leaves → bits.Len64(8)=4 → rootLevel=3
 
-	// Process subgraphs in order
+	// pending[level] holds an unpaired left node waiting for its right sibling
+	// pendingIdx[level] is the node index of that pending node
+	var pending [MaxLayers][commpDigestSize]byte
+	var pendingIdx [MaxLayers]uint64
+	var pendingValid [MaxLayers]bool
+	h := sha256simd.New()
+
+	// combineAt combines a left node (at leftIdx) with a right node and propagates up the tree.
+	// Parameters:
+	//   level: the tree level where left and right reside (0 = leaf level)
+	//   leftIdx: the node index of the left child (must be even)
+	//   left, right: the 32-byte hashes of the left and right children
+	//
+	// The function computes parent = hash(left || right) and then:
+	//   - If parent is a left child at level+1, stores it in pending[level+1]
+	//   - If parent is a right child at level+1, combines with pending[level+1] or pads with zero
+	var combineAt func(level int, leftIdx uint64, left, right *[commpDigestSize]byte)
+	combineAt = func(level int, leftIdx uint64, left, right *[commpDigestSize]byte) {
+		var parent [commpDigestSize]byte
+		h.Reset()
+		h.Write(left[:])
+		h.Write(right[:])
+		h.Sum(parent[:0])
+		parent[31] &= 0x3F // Clear top 2 bits for FR32 validity
+
+		parentIdx := leftIdx / 2
+
+		// Check if we've reached the root level
+		if level+1 == rootLevel {
+			pending[level+1] = parent
+			pendingIdx[level+1] = parentIdx
+			pendingValid[level+1] = true
+			return
+		}
+
+		if isLeft(parentIdx) {
+			// Parent is a left child, store as pending for future right sibling
+			pending[level+1] = parent
+			pendingIdx[level+1] = parentIdx
+			pendingValid[level+1] = true
+		} else {
+			// Parent is a right child, needs to combine with its left sibling
+			if pendingValid[level+1] && pendingIdx[level+1] == parentIdx-1 {
+				// We have the left sibling in pending, combine them
+				combineAt(level+1, pendingIdx[level+1], &pending[level+1], &parent)
+				pendingValid[level+1] = false
+			} else {
+				// No left sibling available, pad with zero commitment
+				// This happens when the left sibling is all zeros (outside data range)
+				var zeroPad [commpDigestSize]byte
+				copy(zeroPad[:], stackedNulPadding[level+1])
+				combineAt(level+1, parentIdx-1, &zeroPad, &parent)
+			}
+		}
+	}
+
+	// Process all chunks in order
 	for chunkIdx := 0; chunkIdx < cp.nextChunkIdx; chunkIdx++ {
 		sg := cp.subgraphs[chunkIdx]
 		if sg == nil {
 			continue
 		}
 
-		// For each level, stitch boundary nodes emitted by the chunk reduction.
+		// Process rightOnLeft boundaries: these are right children whose left sibling
+		// is in a previous chunk (stored in pending) or needs zero padding
 		for level := 0; level < int(MaxLayers); level++ {
 			if sg.rightValid[level] {
-				// This chunk has a right node that needs its left sibling
-				if carryValid[level] {
-					// We have a left sibling from previous chunk, combine them
-					var parentHash [commpDigestSize]byte
-					h.Reset()
-					h.Write(carry[level][:])
-					h.Write(sg.rightOnLeft[level][:])
-					h.Sum(parentHash[:0])
-					parentHash[31] &= 0x3F
+				// Use the stored node index for this boundary node
+				rightIdx := sg.rightOnLeftIdx[level]
+				leftIdx := rightIdx - 1
 
-					// This becomes a node at level+1, feed it up
-					feedUp(h, &carry, &carryValid, level+1, &parentHash)
-					carryValid[level] = false
+				if pendingValid[level] && pendingIdx[level] == leftIdx {
+					// Found matching left sibling from previous chunk
+					combineAt(level, leftIdx, &pending[level], &sg.rightOnLeft[level])
+					pendingValid[level] = false
 				} else {
-					// No left sibling from previous chunk
-					// The left sibling must be zero padding
-					var parentHash [commpDigestSize]byte
-					h.Reset()
-					h.Write(stackedNulPadding[level])
-					h.Write(sg.rightOnLeft[level][:])
-					h.Sum(parentHash[:0])
-					parentHash[31] &= 0x3F
-
-					feedUp(h, &carry, &carryValid, level+1, &parentHash)
+					// No left sibling (offset scenario or first chunk), pad with zero
+					var zeroPad [commpDigestSize]byte
+					copy(zeroPad[:], stackedNulPadding[level])
+					combineAt(level, leftIdx, &zeroPad, &sg.rightOnLeft[level])
 				}
-
 			}
+		}
 
+		// Transfer chunk's left nodes to pending for the next chunk
+		for level := 0; level < int(MaxLayers); level++ {
 			if sg.leftValid[level] {
-				// This chunk ends with a left node at this level
-				// It becomes the new carry for the next chunk
-				if carryValid[level] {
-					// There's already a carry at this level - this means the previous
-					// chunk's left node at this level needs to be combined with zero padding
-					var parentHash [commpDigestSize]byte
-					h.Reset()
-					h.Write(carry[level][:])
-					h.Write(stackedNulPadding[level])
-					h.Sum(parentHash[:0])
-					parentHash[31] &= 0x3F
-					feedUp(h, &carry, &carryValid, level+1, &parentHash)
-				}
-				copy(carry[level][:], sg.left[level][:])
-				carryValid[level] = true
+				pending[level] = sg.left[level]
+				// Use the stored node index
+				pendingIdx[level] = sg.leftIdx[level]
+				pendingValid[level] = true
 			}
 		}
 	}
 
-	// After processing all chunks, collapse remaining carries with zero padding
-	// up to the tree height (but not beyond!)
-	for level := 0; level < treeHeight; level++ {
-		if carryValid[level] {
-			// This carry needs a right sibling (zero padding)
-			var parentHash [commpDigestSize]byte
-			h.Reset()
-			h.Write(carry[level][:])
-			h.Write(stackedNulPadding[level])
-			h.Sum(parentHash[:0])
-			parentHash[31] &= 0x3F
-
-			carryValid[level] = false
-
-			// Feed up to next level
-			if carryValid[level+1] {
-				// Combine with existing carry at next level
-				var combined [commpDigestSize]byte
-				h.Reset()
-				h.Write(carry[level+1][:])
-				h.Write(parentHash[:])
-				h.Sum(combined[:0])
-				combined[31] &= 0x3F
-				copy(carry[level+1][:], combined[:])
-			} else {
-				copy(carry[level+1][:], parentHash[:])
-				carryValid[level+1] = true
-			}
+	// Finalize: pad any remaining pending nodes with zero and propagate to root
+	// These are left children that never got a right sibling (beyond totalLeaves)
+	//
+	// Example for 5 leaves (padded to 8):
+	//   pending[0] = leaf4 (index 4)
+	//   pending[2] = nodeA (index 0, from leaves 0-3)
+	//   Finalize:
+	//     Level 0: combine leaf4 + zero → node at level 1, index 2
+	//     Level 1: combine node + stackedNulPadding[1] → node at level 2, index 1 (right child!)
+	//              → combines with pending[2] (nodeA at index 0) → ROOT
+	for level := 0; level < rootLevel; level++ {
+		if pendingValid[level] {
+			var zeroPad [commpDigestSize]byte
+			copy(zeroPad[:], stackedNulPadding[level])
+			combineAt(level, pendingIdx[level], &pending[level], &zeroPad)
+			pendingValid[level] = false
 		}
 	}
 
-	// The root should be at treeHeight
-	if carryValid[treeHeight] {
-		return carry[treeHeight]
+	// Return the root
+	if pendingValid[rootLevel] {
+		return pending[rootLevel]
 	}
 
-	// Fallback: find the highest level with a valid carry
-	for level := int(MaxLayers) - 1; level >= 0; level-- {
-		if carryValid[level] {
-			return carry[level]
-		}
-	}
-
-	// No data - return zero
+	// Should never reach here if we have data
 	var zero [commpDigestSize]byte
 	return zero
-}
-
-// feedUp takes a hash at a given level and feeds it up through the carry structure
-func feedUp(h hash.Hash, carry *[MaxLayers][commpDigestSize]byte, carryValid *[MaxLayers]bool, level int, data *[commpDigestSize]byte) {
-	if level >= int(MaxLayers) {
-		return
-	}
-
-	if carryValid[level] {
-		// Combine with existing carry
-		var parentHash [commpDigestSize]byte
-		h.Reset()
-		h.Write(carry[level][:])
-		h.Write(data[:])
-		h.Sum(parentHash[:0])
-		parentHash[31] &= 0x3F
-
-		carryValid[level] = false
-		feedUp(h, carry, carryValid, level+1, &parentHash)
-	} else {
-		// Store as new carry
-		copy(carry[level][:], data[:])
-		carryValid[level] = true
-	}
 }
 
 // isZero checks if a byte slice is all zeros
