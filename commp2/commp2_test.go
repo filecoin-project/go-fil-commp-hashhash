@@ -216,11 +216,13 @@ func TestQuadFromBuf(t *testing.T) {
 		buf := makeTestBuf(30)
 		out := make([]byte, 128)
 
-		// Buffer starts at stream byte 95, within leaf 3 [93,127)
+		// Buffer starts at stream byte 95. Due to FR32 bit shifting,
+		// byte 95's bottom 2 bits go to leaf 2, top 6 bits to leaf 3.
+		// So data starting at byte 95 affects leaves 2-3.
 		startLeaf, endLeaf := quadFromBuf(out, buf, 95, 0)
 
-		if startLeaf != 3 || endLeaf != 3 {
-			t.Errorf("expected leaves 3-3, got %d-%d", startLeaf, endLeaf)
+		if startLeaf != 2 || endLeaf != 3 {
+			t.Errorf("expected leaves 2-3, got %d-%d", startLeaf, endLeaf)
 		}
 	})
 }
@@ -500,4 +502,593 @@ func formatSize(size int64) string {
 		return fmt.Sprintf("%dKB", size/(1<<10))
 	}
 	return fmt.Sprintf("%dB", size)
+}
+
+// TestBeginAt_QuadAligned tests BeginAt with offsets aligned to quad boundaries (127 bytes)
+func TestBeginAt_QuadAligned(t *testing.T) {
+	// Test offsets at exact quad boundaries
+	quadBoundaries := []int64{
+		127,       // 1 quad
+		127 * 2,   // 2 quads
+		127 * 4,   // 4 quads
+		127 * 8,   // 8 quads
+		127 * 16,  // 16 quads
+		127 * 64,  // 64 quads
+		127 * 256, // 256 quads
+		127 * 512, // 512 quads (64KB)
+	}
+
+	for _, offset := range quadBoundaries {
+		t.Run(fmt.Sprintf("offset_%d", offset), func(t *testing.T) {
+			dataSize := int64(127 * 4) // 4 quads of data
+			data := generateRandomData(dataSize, 12345)
+
+			// v1: create full piece with zeros + data
+			totalSize := offset + dataSize
+			largePiece := make([]byte, totalSize)
+			copy(largePiece[offset:], data)
+
+			v1Calc := &commp.Calc{}
+			if _, err := io.Copy(v1Calc, bytes.NewReader(largePiece)); err != nil {
+				t.Fatalf("v1 Write failed: %v", err)
+			}
+			v1CommP, v1PaddedSize, err := v1Calc.Digest()
+			if err != nil {
+				t.Fatalf("v1 Digest failed: %v", err)
+			}
+
+			// v2: use BeginAt
+			v2Calc := &Calc{}
+			if err := v2Calc.BeginAt(uint64(offset)); err != nil {
+				t.Fatalf("v2 BeginAt failed: %v", err)
+			}
+			if _, err := v2Calc.Write(data); err != nil {
+				t.Fatalf("v2 Write failed: %v", err)
+			}
+			v2CommP, v2PaddedSize, err := v2Calc.Digest()
+			if err != nil {
+				t.Fatalf("v2 Digest failed: %v", err)
+			}
+
+			if v1PaddedSize != v2PaddedSize {
+				t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
+			}
+			if !bytes.Equal(v1CommP, v2CommP) {
+				t.Errorf("commP mismatch at offset %d:\n  v1: %x\n  v2: %x", offset, v1CommP, v2CommP)
+			}
+		})
+	}
+}
+
+// TestBeginAt_MidQuad tests BeginAt with offsets in the middle of quads (non-127-aligned)
+func TestBeginAt_MidQuad(t *testing.T) {
+	testCases := []struct {
+		name   string
+		offset int64
+	}{
+		{"mid_first_quad", 50},             // Middle of first quad
+		{"leaf_boundary_31", 31},           // Start of leaf 1
+		{"leaf_boundary_62", 62},           // Start of leaf 2
+		{"leaf_boundary_93", 93},           // Start of leaf 3
+		{"mid_second_quad", 127 + 50},      // Middle of second quad
+		{"mid_tenth_quad", 127*10 + 63},    // Middle of tenth quad
+		{"arbitrary_1234", 1234},           // Arbitrary offset
+		{"arbitrary_5678", 5678},           // Another arbitrary offset
+		{"large_unaligned", 127*100 + 100}, // Large unaligned offset
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataSize := int64(254) // 2 quads of data
+			data := generateRandomData(dataSize, 54321)
+
+			// v1: create full piece with zeros + data
+			totalSize := tc.offset + dataSize
+			largePiece := make([]byte, totalSize)
+			copy(largePiece[tc.offset:], data)
+
+			v1Calc := &commp.Calc{}
+			if _, err := io.Copy(v1Calc, bytes.NewReader(largePiece)); err != nil {
+				t.Fatalf("v1 Write failed: %v", err)
+			}
+			v1CommP, v1PaddedSize, err := v1Calc.Digest()
+			if err != nil {
+				t.Fatalf("v1 Digest failed: %v", err)
+			}
+
+			// v2: use BeginAt
+			v2Calc := &Calc{}
+			if err := v2Calc.BeginAt(uint64(tc.offset)); err != nil {
+				t.Fatalf("v2 BeginAt failed: %v", err)
+			}
+			if _, err := v2Calc.Write(data); err != nil {
+				t.Fatalf("v2 Write failed: %v", err)
+			}
+			v2CommP, v2PaddedSize, err := v2Calc.Digest()
+			if err != nil {
+				t.Fatalf("v2 Digest failed: %v", err)
+			}
+
+			if v1PaddedSize != v2PaddedSize {
+				t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
+			}
+			if !bytes.Equal(v1CommP, v2CommP) {
+				t.Errorf("commP mismatch at offset %d:\n  v1: %x\n  v2: %x", tc.offset, v1CommP, v2CommP)
+			}
+		})
+	}
+}
+
+// TestBeginAt_SmallData tests BeginAt with very small data sizes at various offsets
+func TestBeginAt_SmallData(t *testing.T) {
+	// Small data sizes that don't fill complete quads
+	smallSizes := []int64{1, 10, 31, 50, 100, 126}
+	offsets := []int64{0, 50, 127, 127 * 10, 127 * 100}
+
+	for _, size := range smallSizes {
+		for _, offset := range offsets {
+			name := fmt.Sprintf("size%d_offset%d", size, offset)
+			t.Run(name, func(t *testing.T) {
+				data := generateRandomData(size, size*1000+offset)
+
+				// v1: create full piece
+				totalSize := offset + size
+				// Ensure minimum size for v1 (65 bytes)
+				if totalSize < 65 {
+					totalSize = 65
+				}
+				largePiece := make([]byte, totalSize)
+				copy(largePiece[offset:], data)
+
+				v1Calc := &commp.Calc{}
+				if _, err := io.Copy(v1Calc, bytes.NewReader(largePiece)); err != nil {
+					t.Fatalf("v1 Write failed: %v", err)
+				}
+				v1CommP, v1PaddedSize, err := v1Calc.Digest()
+				if err != nil {
+					t.Fatalf("v1 Digest failed: %v", err)
+				}
+
+				// v2: use BeginAt
+				v2Calc := &Calc{}
+				if err := v2Calc.BeginAt(uint64(offset)); err != nil {
+					t.Fatalf("v2 BeginAt failed: %v", err)
+				}
+				if _, err := v2Calc.Write(data); err != nil {
+					t.Fatalf("v2 Write failed: %v", err)
+				}
+				v2CommP, v2PaddedSize, err := v2Calc.Digest()
+				if err != nil {
+					t.Fatalf("v2 Digest failed: %v", err)
+				}
+
+				if v1PaddedSize != v2PaddedSize {
+					t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
+				}
+				if !bytes.Equal(v1CommP, v2CommP) {
+					t.Errorf("commP mismatch (size=%d, offset=%d):\n  v1: %x\n  v2: %x",
+						size, offset, v1CommP, v2CommP)
+				}
+			})
+		}
+	}
+}
+
+// TestBeginAt_TreeLevelBoundaries tests offsets that create boundaries at different tree levels
+func TestBeginAt_TreeLevelBoundaries(t *testing.T) {
+	// Offsets that create boundaries at specific tree levels
+	// Level L boundary: offset = 2^L * 32 bytes (in padded space) = 2^L * 31.75 bytes (in payload space)
+	// Using quad-aligned offsets for simplicity: 127 * 2^(L-2) bytes
+	testCases := []struct {
+		name   string
+		offset int64
+	}{
+		{"level_2_boundary", 127 * 1},       // 4 leaves = 1 quad
+		{"level_3_boundary", 127 * 2},       // 8 leaves = 2 quads
+		{"level_4_boundary", 127 * 4},       // 16 leaves = 4 quads
+		{"level_5_boundary", 127 * 8},       // 32 leaves = 8 quads
+		{"level_6_boundary", 127 * 16},      // 64 leaves = 16 quads
+		{"level_7_boundary", 127 * 32},      // 128 leaves = 32 quads
+		{"level_8_boundary", 127 * 64},      // 256 leaves = 64 quads
+		{"level_9_boundary", 127 * 128},     // 512 leaves = 128 quads
+		{"level_10_boundary", 127 * 256},    // 1024 leaves = 256 quads
+		{"level_11_boundary", 127 * 512},    // 2048 leaves = 512 quads
+		{"level_12_boundary", 127 * 1024},   // 4096 leaves = 1024 quads (128KB)
+		{"just_past_level_5", 127*8 + 50},   // Just past level 5 boundary
+		{"just_past_level_8", 127*64 + 100}, // Just past level 8 boundary
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			dataSize := int64(127 * 8) // 8 quads = 32 leaves
+			data := generateRandomData(dataSize, 99999)
+
+			// v1
+			totalSize := tc.offset + dataSize
+			largePiece := make([]byte, totalSize)
+			copy(largePiece[tc.offset:], data)
+
+			v1Calc := &commp.Calc{}
+			if _, err := io.Copy(v1Calc, bytes.NewReader(largePiece)); err != nil {
+				t.Fatalf("v1 Write failed: %v", err)
+			}
+			v1CommP, v1PaddedSize, err := v1Calc.Digest()
+			if err != nil {
+				t.Fatalf("v1 Digest failed: %v", err)
+			}
+
+			// v2
+			v2Calc := &Calc{}
+			if err := v2Calc.BeginAt(uint64(tc.offset)); err != nil {
+				t.Fatalf("v2 BeginAt failed: %v", err)
+			}
+			if _, err := v2Calc.Write(data); err != nil {
+				t.Fatalf("v2 Write failed: %v", err)
+			}
+			v2CommP, v2PaddedSize, err := v2Calc.Digest()
+			if err != nil {
+				t.Fatalf("v2 Digest failed: %v", err)
+			}
+
+			if v1PaddedSize != v2PaddedSize {
+				t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
+			}
+			if !bytes.Equal(v1CommP, v2CommP) {
+				t.Errorf("commP mismatch:\n  v1: %x\n  v2: %x", v1CommP, v2CommP)
+			}
+		})
+	}
+}
+
+// TestStitching_MultipleChunks tests stitching across multiple chunks with varying sizes
+func TestStitching_MultipleChunks(t *testing.T) {
+	// Test data sizes that span multiple chunks
+	// TargetDigestChunk is roughly 4MB / 128 * 127 ≈ 4MB payload per chunk
+	// Use smaller sizes that still create multiple chunks
+
+	// Save original and use smaller chunk size for testing
+	origChunk := TargetDigestChunk
+	defer func() { TargetDigestChunk = origChunk }()
+
+	chunkSizes := []uint64{
+		127 * 8,   // 8 quads per chunk (1KB)
+		127 * 16,  // 16 quads per chunk (2KB)
+		127 * 32,  // 32 quads per chunk (4KB)
+		127 * 64,  // 64 quads per chunk (8KB)
+		127 * 128, // 128 quads per chunk (16KB)
+	}
+
+	for _, chunkSize := range chunkSizes {
+		TargetDigestChunk = chunkSize
+
+		// Test various data sizes relative to chunk size
+		dataSizes := []int64{
+			int64(chunkSize) - 127,     // Just under 1 chunk
+			int64(chunkSize),           // Exactly 1 chunk
+			int64(chunkSize) + 127,     // Just over 1 chunk
+			int64(chunkSize) * 2,       // 2 chunks
+			int64(chunkSize)*2 + 500,   // 2+ chunks
+			int64(chunkSize) * 3,       // 3 chunks
+			int64(chunkSize)*3 + 1000,  // 3+ chunks
+			int64(chunkSize) * 5,       // 5 chunks
+			int64(chunkSize)*7 + 12345, // 7+ chunks with odd remainder
+		}
+
+		for _, dataSize := range dataSizes {
+			name := fmt.Sprintf("chunk%d_data%d", chunkSize, dataSize)
+			t.Run(name, func(t *testing.T) {
+				data := generateRandomData(dataSize, dataSize)
+
+				// v1
+				v1Calc := &commp.Calc{}
+				if _, err := io.Copy(v1Calc, bytes.NewReader(data)); err != nil {
+					t.Fatalf("v1 Write failed: %v", err)
+				}
+				v1CommP, v1PaddedSize, err := v1Calc.Digest()
+				if err != nil {
+					t.Fatalf("v1 Digest failed: %v", err)
+				}
+
+				// v2
+				v2Calc := &Calc{}
+				if _, err := v2Calc.Write(data); err != nil {
+					t.Fatalf("v2 Write failed: %v", err)
+				}
+				v2CommP, v2PaddedSize, err := v2Calc.Digest()
+				if err != nil {
+					t.Fatalf("v2 Digest failed: %v", err)
+				}
+
+				if v1PaddedSize != v2PaddedSize {
+					t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
+				}
+				if !bytes.Equal(v1CommP, v2CommP) {
+					t.Errorf("commP mismatch:\n  v1: %x\n  v2: %x", v1CommP, v2CommP)
+				}
+			})
+		}
+	}
+}
+
+// TestStitching_WithOffset_MultipleChunks tests stitching with BeginAt across multiple chunks
+func TestStitching_WithOffset_MultipleChunks(t *testing.T) {
+	// Use smaller chunk size for testing
+	origChunk := TargetDigestChunk
+	TargetDigestChunk = 127 * 32 // 32 quads per chunk (4KB)
+	defer func() { TargetDigestChunk = origChunk }()
+
+	testCases := []struct {
+		name     string
+		offset   int64
+		dataSize int64
+	}{
+		{"offset_1chunk_data_2chunks", 127 * 32, 127 * 64},
+		{"offset_half_chunk_data_3chunks", 127 * 16, 127 * 96},
+		{"offset_2chunks_data_1chunk", 127 * 64, 127 * 32},
+		{"offset_unaligned_data_multiple", 127*32 + 500, 127 * 80},
+		{"large_offset_small_data", 127 * 200, 127 * 10},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			data := generateRandomData(tc.dataSize, tc.offset+tc.dataSize)
+
+			// v1
+			totalSize := tc.offset + tc.dataSize
+			largePiece := make([]byte, totalSize)
+			copy(largePiece[tc.offset:], data)
+
+			v1Calc := &commp.Calc{}
+			if _, err := io.Copy(v1Calc, bytes.NewReader(largePiece)); err != nil {
+				t.Fatalf("v1 Write failed: %v", err)
+			}
+			v1CommP, v1PaddedSize, err := v1Calc.Digest()
+			if err != nil {
+				t.Fatalf("v1 Digest failed: %v", err)
+			}
+
+			// v2
+			v2Calc := &Calc{}
+			if err := v2Calc.BeginAt(uint64(tc.offset)); err != nil {
+				t.Fatalf("v2 BeginAt failed: %v", err)
+			}
+			if _, err := v2Calc.Write(data); err != nil {
+				t.Fatalf("v2 Write failed: %v", err)
+			}
+			v2CommP, v2PaddedSize, err := v2Calc.Digest()
+			if err != nil {
+				t.Fatalf("v2 Digest failed: %v", err)
+			}
+
+			if v1PaddedSize != v2PaddedSize {
+				t.Errorf("padded size mismatch: v1=%d, v2=%d", v1PaddedSize, v2PaddedSize)
+			}
+			if !bytes.Equal(v1CommP, v2CommP) {
+				t.Errorf("commP mismatch:\n  v1: %x\n  v2: %x", v1CommP, v2CommP)
+			}
+		})
+	}
+}
+
+// TestStitching_IncrementalWrites tests that multiple Write calls produce same result as single Write
+func TestStitching_IncrementalWrites(t *testing.T) {
+	dataSize := int64(127 * 100) // 100 quads
+	data := generateRandomData(dataSize, 777)
+
+	// Single write
+	v2Single := &Calc{}
+	if _, err := v2Single.Write(data); err != nil {
+		t.Fatalf("single Write failed: %v", err)
+	}
+	singleCommP, singleSize, err := v2Single.Digest()
+	if err != nil {
+		t.Fatalf("single Digest failed: %v", err)
+	}
+
+	// Multiple small writes
+	writeSizes := []int{1, 10, 50, 100, 127, 200, 500, 1000}
+	for _, writeSize := range writeSizes {
+		t.Run(fmt.Sprintf("writeSize_%d", writeSize), func(t *testing.T) {
+			v2Multi := &Calc{}
+			remaining := data
+			for len(remaining) > 0 {
+				toWrite := writeSize
+				if toWrite > len(remaining) {
+					toWrite = len(remaining)
+				}
+				if _, err := v2Multi.Write(remaining[:toWrite]); err != nil {
+					t.Fatalf("incremental Write failed: %v", err)
+				}
+				remaining = remaining[toWrite:]
+			}
+			multiCommP, multiSize, err := v2Multi.Digest()
+			if err != nil {
+				t.Fatalf("incremental Digest failed: %v", err)
+			}
+
+			if singleSize != multiSize {
+				t.Errorf("size mismatch: single=%d, multi=%d", singleSize, multiSize)
+			}
+			if !bytes.Equal(singleCommP, multiCommP) {
+				t.Errorf("commP mismatch:\n  single: %x\n  multi:  %x", singleCommP, multiCommP)
+			}
+		})
+	}
+}
+
+// TestReset verifies that Reset properly clears state for reuse
+func TestReset(t *testing.T) {
+	data1 := generateRandomData(1000, 111)
+	data2 := generateRandomData(2000, 222)
+
+	calc := &Calc{}
+
+	// First computation
+	if _, err := calc.Write(data1); err != nil {
+		t.Fatalf("first Write failed: %v", err)
+	}
+	commP1, _, err := calc.Digest()
+	if err != nil {
+		t.Fatalf("first Digest failed: %v", err)
+	}
+
+	// Reset and compute again with different data
+	calc.Reset()
+	if _, err := calc.Write(data2); err != nil {
+		t.Fatalf("second Write failed: %v", err)
+	}
+	commP2, _, err := calc.Digest()
+	if err != nil {
+		t.Fatalf("second Digest failed: %v", err)
+	}
+
+	// Results should be different
+	if bytes.Equal(commP1, commP2) {
+		t.Error("commP should be different after Reset with different data")
+	}
+
+	// Verify second result matches fresh computation
+	freshCalc := &Calc{}
+	if _, err := freshCalc.Write(data2); err != nil {
+		t.Fatalf("fresh Write failed: %v", err)
+	}
+	freshCommP, _, err := freshCalc.Digest()
+	if err != nil {
+		t.Fatalf("fresh Digest failed: %v", err)
+	}
+
+	if !bytes.Equal(commP2, freshCommP) {
+		t.Errorf("Reset didn't properly clear state:\n  after reset: %x\n  fresh:       %x", commP2, freshCommP)
+	}
+}
+
+// Benchmarks
+
+func BenchmarkV2_Write(b *testing.B) {
+	sizes := []int64{
+		127,          // 1 quad
+		127 * 8,      // 8 quads (1KB)
+		127 * 80,     // ~10KB
+		127 * 800,    // ~100KB
+		127 * 8000,   // ~1MB
+		127 * 80000,  // ~10MB
+		127 * 400000, // ~50MB
+	}
+
+	for _, size := range sizes {
+		data := generateRandomData(size, 12345)
+		b.Run(formatSize(size), func(b *testing.B) {
+			b.SetBytes(size)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				calc := &Calc{}
+				calc.Write(data)
+				calc.Digest()
+			}
+		})
+	}
+}
+
+func BenchmarkV1_Write(b *testing.B) {
+	sizes := []int64{
+		127,          // 1 quad
+		127 * 8,      // 8 quads (1KB)
+		127 * 80,     // ~10KB
+		127 * 800,    // ~100KB
+		127 * 8000,   // ~1MB
+		127 * 80000,  // ~10MB
+		127 * 400000, // ~50MB
+	}
+
+	for _, size := range sizes {
+		data := generateRandomData(size, 12345)
+		b.Run(formatSize(size), func(b *testing.B) {
+			b.SetBytes(size)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				calc := &commp.Calc{}
+				io.Copy(calc, bytes.NewReader(data))
+				calc.Digest()
+			}
+		})
+	}
+}
+
+func BenchmarkV2_WithOffset(b *testing.B) {
+	// Benchmark offset-aware CommP computation
+	dataSize := int64(127 * 800) // ~100KB of actual data
+	data := generateRandomData(dataSize, 12345)
+
+	offsets := []int64{
+		0,
+		127 * 100,   // ~12KB offset
+		127 * 1000,  // ~125KB offset
+		127 * 10000, // ~1.2MB offset
+	}
+
+	for _, offset := range offsets {
+		b.Run(fmt.Sprintf("offset_%s", formatSize(offset)), func(b *testing.B) {
+			b.SetBytes(dataSize)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				calc := &Calc{}
+				calc.BeginAt(uint64(offset))
+				calc.Write(data)
+				calc.Digest()
+			}
+		})
+	}
+}
+
+func BenchmarkV2_Parallel(b *testing.B) {
+	// Test parallel processing benefit with different parallelism levels
+	dataSize := int64(127 * 80000) // ~10MB
+	data := generateRandomData(dataSize, 12345)
+
+	parallelisms := []int{1, 2, 4, 8, 16}
+	origParallelism := DefaultParallelism
+	defer func() { DefaultParallelism = origParallelism }()
+
+	for _, p := range parallelisms {
+		DefaultParallelism = p
+		b.Run(fmt.Sprintf("parallel_%d", p), func(b *testing.B) {
+			b.SetBytes(dataSize)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				calc := &Calc{}
+				calc.Write(data)
+				calc.Digest()
+			}
+		})
+	}
+}
+
+func BenchmarkStitching(b *testing.B) {
+	// Benchmark stitching overhead with different chunk sizes
+	dataSize := int64(127 * 8000) // ~1MB
+	data := generateRandomData(dataSize, 12345)
+
+	origChunk := TargetDigestChunk
+	defer func() { TargetDigestChunk = origChunk }()
+
+	chunkSizes := []uint64{
+		127 * 8,    // Very small chunks (lots of stitching)
+		127 * 64,   // Small chunks
+		127 * 512,  // Medium chunks
+		127 * 4096, // Large chunks (less stitching)
+	}
+
+	for _, chunkSize := range chunkSizes {
+		TargetDigestChunk = chunkSize
+		numChunks := dataSize / int64(chunkSize)
+		b.Run(fmt.Sprintf("chunks_%d", numChunks), func(b *testing.B) {
+			b.SetBytes(dataSize)
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				calc := &Calc{}
+				calc.Write(data)
+				calc.Digest()
+			}
+		})
+	}
 }

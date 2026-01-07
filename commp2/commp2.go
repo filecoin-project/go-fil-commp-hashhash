@@ -371,8 +371,9 @@ func quadFromBuf(out []byte, buf []byte, start uint64, quadIdx uint64) (startLea
 	}
 
 	// Find first and last leaf (0-indexed, max numLeaves-1) that contain any data
-	// Leaf boundaries in payload space: [0,31), [31,62), [62,93), [93,127)
-	startLeaf = payloadPosToLeaf(int(dataStartInQuad))
+	// Use payloadPosToLeafStart for start (accounts for FR32 bit bleeding backward)
+	// Use payloadPosToLeaf for end (last byte determines last affected leaf)
+	startLeaf = payloadPosToLeafStart(int(dataStartInQuad))
 	endLeaf = payloadPosToLeaf(int(dataEndInQuad) - 1)
 
 	if endLeaf < startLeaf {
@@ -397,6 +398,7 @@ func quadFromBuf(out []byte, buf []byte, start uint64, quadIdx uint64) (startLea
 }
 
 // payloadPosToLeaf returns which leaf (0-3) a payload byte position falls into.
+// Used for determining the LAST leaf containing data (end position).
 // Leaf boundaries: [0,31), [31,62), [62,93), [93,127)
 func payloadPosToLeaf(pos int) int {
 	switch {
@@ -405,6 +407,26 @@ func payloadPosToLeaf(pos int) int {
 	case pos < 62:
 		return 1
 	case pos < 93:
+		return 2
+	default:
+		return 3
+	}
+}
+
+// payloadPosToLeafStart returns the FIRST leaf affected by data starting at this position.
+// Due to FR32 bit-shifting, each leaf depends on a range of input bytes:
+//   - Leaf 0: input bytes 0-31
+//   - Leaf 1: input bytes 31-63 (byte 31 carries into leaf 1, byte 63 shifts into it)
+//   - Leaf 2: input bytes 63-95
+//   - Leaf 3: input bytes 95-126
+// Therefore, boundaries are: [0,32), [32,64), [64,96), [96,127)
+func payloadPosToLeafStart(pos int) int {
+	switch {
+	case pos < 32:
+		return 0
+	case pos < 64:
+		return 1
+	case pos < 96:
 		return 2
 	default:
 		return 3
