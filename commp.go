@@ -297,6 +297,13 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 				// I am last
 				if myIdx == MaxLayers || cp.layerQueues[myIdx+2] == nil {
+					if twinHold == nil {
+						// If twinHold is nil, we haven't processed enough data.
+						// Send a zero-value hash to prevent panic and unblock the receiver.
+						cp.resultCommP <- make([]byte, 32)
+						return
+					}
+
 					cp.resultCommP <- append(make([]byte, 0, 32), twinHold[0:32]...)
 					return
 				}
