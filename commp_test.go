@@ -254,3 +254,138 @@ func getTestCases(path string, shortOnly bool) ([]testCase, error) {
 
 	return ret, nil
 }
+
+// TestResetAfterSmallWrite verifies Reset() handles the case where Write()
+// was called (starting the addLayer goroutine) but no complete slabs were
+// processed. The goroutine must handle nil twinHold when receiving the
+// close signal.
+func TestResetAfterSmallWrite(t *testing.T) {
+	cp := &Calc{}
+
+	// Write a single byte - this initializes internal state and starts
+	// the addLayer(0) goroutine, but data stays in buffer (not processed
+	// into slabs since it's less than bufferSize)
+	_, err := cp.Write([]byte{0x42})
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Reset() closes channels and waits for goroutine cleanup.
+	// Must not panic even though no slabs were processed.
+	cp.Reset()
+}
+
+// TestResetWithoutWrite verifies Reset() is safe on an uninitialized Calc.
+// Write(empty) is a no-op, so no goroutine is started.
+func TestResetWithoutWrite(t *testing.T) {
+	cp := &Calc{}
+
+	// Write zero bytes is a no-op
+	_, err := cp.Write([]byte{})
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Reset on never-initialized calc is safe
+	cp.Reset()
+}
+
+// TestDigestErrorThenReset verifies that Reset() correctly cleans up after
+// Digest() returns an error due to insufficient data. When Digest() errors,
+// it does NOT close channels, so callers must call Reset() for cleanup.
+func TestDigestErrorThenReset(t *testing.T) {
+	cp := &Calc{}
+
+	// Write less than MinPiecePayload (65 bytes)
+	data := make([]byte, 23)
+	_, err := cp.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Digest returns error for insufficient data
+	_, _, err = cp.Digest()
+	if err == nil {
+		t.Fatal("Expected error from Digest() with insufficient data")
+	}
+
+	// Reset cleans up goroutine - must not panic
+	cp.Reset()
+}
+
+// TestDigestWithoutWrite verifies Digest() without any writes returns an
+// error and does not panic. No goroutine is started in this case.
+func TestDigestWithoutWrite(t *testing.T) {
+	cp := &Calc{}
+
+	// Digest with no data returns error
+	_, _, err := cp.Digest()
+	if err == nil {
+		t.Fatal("Expected error from Digest() with no data")
+	}
+
+	// Reset on never-initialized calc is safe
+	cp.Reset()
+}
+
+// TestMultipleResets verifies that calling Reset() multiple times is safe.
+func TestMultipleResets(t *testing.T) {
+	cp := &Calc{}
+
+	// Write some data to start goroutine
+	_, err := cp.Write([]byte{0x42})
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Multiple resets are safe
+	cp.Reset()
+	cp.Reset()
+	cp.Reset()
+}
+
+// TestReuseAfterDigestError verifies that a Calc can be reused after
+// Digest() returns an error, provided Reset() is called first.
+func TestReuseAfterDigestError(t *testing.T) {
+	cp := &Calc{}
+
+	// Write 64 bytes (one less than MinPiecePayload)
+	data := make([]byte, 64)
+	for i := range data {
+		data[i] = byte(i)
+	}
+	_, err := cp.Write(data)
+	if err != nil {
+		t.Fatalf("Write failed: %v", err)
+	}
+
+	// Digest fails due to insufficient data
+	_, _, err = cp.Digest()
+	if err == nil {
+		t.Fatal("Expected error from Digest() with 64 bytes")
+	}
+
+	// Reset to clean up
+	cp.Reset()
+
+	// Calc is reusable after reset
+	data2 := make([]byte, 127)
+	for i := range data2 {
+		data2[i] = byte(i)
+	}
+	_, err = cp.Write(data2)
+	if err != nil {
+		t.Fatalf("Write after reset failed: %v", err)
+	}
+
+	commP, size, err := cp.Digest()
+	if err != nil {
+		t.Fatalf("Digest after reset failed: %v", err)
+	}
+	if len(commP) != 32 {
+		t.Errorf("Expected 32-byte commP, got %d", len(commP))
+	}
+	if size != 128 { // 127 bytes pads to 128 (FR32: 127 -> 128)
+		t.Errorf("Expected piece size 128, got %d", size)
+	}
+}

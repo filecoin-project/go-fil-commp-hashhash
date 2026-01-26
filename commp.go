@@ -21,6 +21,20 @@ import (
 // Calc is an implementation of a commP "hash" calculator, implementing the
 // familiar hash.Hash interface. The zero-value of this object is ready to
 // accept Write()s without further initialization.
+//
+// Write() starts background goroutines that must be cleaned up. Always defer
+// Reset() to ensure cleanup, especially if Digest() may return an error:
+//
+//	cp := &commp.Calc{}
+//	defer cp.Reset()
+//
+//	if _, err := io.Copy(cp, reader); err != nil {
+//		return err
+//	}
+//	commP, paddedSize, err := cp.Digest()
+//	if err != nil {
+//		return err
+//	}
 type Calc struct {
 	state
 	mu sync.Mutex
@@ -114,8 +128,9 @@ func (cp *Calc) Sum(buf []byte) []byte {
 
 // Digest collapses the internal hash state and returns the resulting raw 32
 // bytes of commP and the padded piece size, or alternatively an error in
-// case of insufficient accumulated state. On success invokes Reset(), which
-// terminates all goroutines kicked off by Write().
+// case of insufficient accumulated state. On success, the internal state is
+// reset and all goroutines are terminated. On error, callers must call
+// Reset() to clean up background goroutines before abandoning the Calc object.
 func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 	cp.mu.Lock()
 
