@@ -37,21 +37,34 @@ import (
 //	}
 type Calc struct {
 	state
-	mu sync.Mutex
+	mu       sync.Mutex
+	snapshot *snapshotState // nil when not capturing a snapshot layer
 }
+
+// snapshotState holds the configuration and collected nodes for snapshot layer
+// capture. It is only allocated when NewCalcWithSnapshot is used. Only a single
+// goroutine (the one at layerIdx-1) writes to nodes, so no synchronization is
+// needed.
+type snapshotState struct {
+	layerIdx int        // which tree layer to capture
+	nodes    [][32]byte // collected nodes, appended by single writer goroutine
+}
+
 type state struct {
 	quadsEnqueued uint64
-	layerQueues   [MaxLayers + 2]chan []byte // one extra layer for the initial leaves, one more for the dummy never-to-use channel
+	layerQueues   [MaxLayers + 2]chan []byte // fixed array, concurrency-safe
 	resultCommP   chan []byte
 	buffer        []byte
 }
 
 var _ hash.Hash = &Calc{} // make sure we are hash.Hash compliant
 
-// MaxLayers is the current maximum height of the rust-fil-proofs proving tree.
-const MaxLayers = uint(31) // result of log2( 64 GiB / 32 )
+// MaxLayers is the maximum height of the merkle tree. This supports pieces up
+// to ~32 PiB padded (2^55 bytes). The cost is a fixed stackedNulPadding array
+// of 50 * 32 = 1600 bytes computed once at init.
+const MaxLayers = uint(50)
 
-// MaxPieceSize is the current maximum size of the rust-fil-proofs proving tree.
+// MaxPieceSize is the maximum padded piece size supported by this library.
 const MaxPieceSize = uint64(1 << (MaxLayers + 5))
 
 // MaxPiecePayload is the maximum amount of data that one can Write() to the
@@ -109,7 +122,10 @@ func (cp *Calc) Reset() {
 		close(cp.layerQueues[0])
 		<-cp.resultCommP
 	}
-	cp.state = state{} // reset
+	if cp.snapshot != nil {
+		cp.snapshot.nodes = cp.snapshot.nodes[:0]
+	}
+	cp.state = state{}
 	cp.mu.Unlock()
 }
 
@@ -133,21 +149,27 @@ func (cp *Calc) Sum(buf []byte) []byte {
 // Reset() to clean up background goroutines before abandoning the Calc object.
 func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 	cp.mu.Lock()
+	defer cp.mu.Unlock()
 
-	defer func() {
-		// reset only if we did succeed
-		if err == nil {
-			cp.state = state{}
+	commP, paddedPieceSize, err = cp.digestCore()
+	if err == nil {
+		if cp.snapshot != nil {
+			cp.snapshot.nodes = cp.snapshot.nodes[:0]
 		}
-		cp.mu.Unlock()
-	}()
+		cp.state = state{}
+	}
+	return
+}
 
+// digestCore performs the digest computation without resetting state.
+// Caller must hold cp.mu. After this returns successfully, all layer
+// goroutines have completed and all snapshot nodes have been collected.
+func (cp *Calc) digestCore() (commP []byte, paddedPieceSize uint64, err error) {
 	if processed := cp.quadsEnqueued*uint64(quadPayload) + uint64(len(cp.buffer)); processed < MinPiecePayload {
-		err = xerrors.Errorf(
+		return nil, 0, xerrors.Errorf(
 			"insufficient state accumulated: commP is not defined for inputs shorter than %d bytes, but only %d processed so far",
 			MinPiecePayload, processed,
 		)
-		return
 	}
 
 	// If any, flush remaining bytes padded up with zeroes
@@ -299,6 +321,9 @@ func (cp *Calc) addLayer(myIdx uint) {
 	}
 	cp.layerQueues[myIdx+1] = make(chan []byte, layerQueueDepth)
 
+	// capture snapshot nodes when hashing produces the target layer
+	collectSnapshot := cp.snapshot != nil && int(myIdx) == cp.snapshot.layerIdx-1
+
 	go func() {
 		s256 := sha256simd.New()
 		var twinHold []byte
@@ -325,7 +350,7 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 				if twinHold != nil {
 					copy(twinHold[32:64], stackedNulPadding[myIdx])
-					cp.hashSlab254(s256, 0, twinHold[0:64])
+					cp.hashSlab254(s256, 0, collectSnapshot, twinHold[0:64])
 					cp.layerQueues[myIdx+1] <- twinHold[0:64:64]
 				}
 
@@ -336,11 +361,11 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 			switch {
 			case uint64(len(slab)) > uint64(1<<(5+myIdx)): // uint64 cast needed on 32-bit systems
-				cp.hashSlab254(s256, myIdx, slab)
+				cp.hashSlab254(s256, myIdx, collectSnapshot, slab)
 				cp.layerQueues[myIdx+1] <- slab
 			case twinHold != nil:
 				copy(twinHold[32:64], slab[0:32])
-				cp.hashSlab254(s256, 0, twinHold[0:64])
+				cp.hashSlab254(s256, 0, collectSnapshot, twinHold[0:64])
 				cp.layerQueues[myIdx+1] <- twinHold[0:32:64]
 				twinHold = nil
 			default:
@@ -360,14 +385,133 @@ func (cp *Calc) addLayer(myIdx uint) {
 	}()
 }
 
-func (cp *Calc) hashSlab254(h hash.Hash, layerIdx uint, slab []byte) {
+func (cp *Calc) hashSlab254(h hash.Hash, layerIdx uint, collectSnapshot bool, slab []byte) {
 	stride := 1 << (5 + layerIdx)
 	for i := 0; len(slab) > i+stride; i += 2 * stride {
 		h.Reset()
 		h.Write(slab[i : i+32])
 		h.Write(slab[i+stride : 32+i+stride])
 		h.Sum(slab[i:i])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
+
+		if collectSnapshot {
+			var node [32]byte
+			copy(node[:], slab[i:i+32])
+			cp.snapshot.nodes = append(cp.snapshot.nodes, node)
+		}
 	}
+}
+
+// SnapshotLayer holds a captured intermediate merkle tree layer from a streaming
+// CommP computation. Each node is the root hash of a subtree covering a
+// contiguous section of the piece data.
+type SnapshotLayer struct {
+	// LayerIndex is the tree layer that was captured (0 = leaf level).
+	LayerIndex int
+	// Nodes contains the 32-byte hashes in sequential order, zero-padded to
+	// the expected count for pieces that don't fill their padded size.
+	Nodes [][32]byte
+}
+
+// SnapshotLayerIndex computes the tree layer index for a target padded section
+// size. Each node at the returned layer covers approximately
+// targetPaddedBytesPerNode bytes of FR32-padded data. The minimum return value
+// is 1 (pairs of leaves, 64 padded bytes per node).
+func SnapshotLayerIndex(targetPaddedBytesPerNode uint64) int {
+	if targetPaddedBytesPerNode <= 64 {
+		return 1
+	}
+	return bits.Len64(targetPaddedBytesPerNode/32 - 1)
+}
+
+// NewCalcWithSnapshot creates a CommP calculator that captures the merkle tree
+// layer at the given index during streaming computation. The minimum layer
+// index is 1 (pairs of leaves); higher indices capture coarser nodes. Values
+// below 1 are clamped.
+//
+// Each node at layer L covers 2^L leaves, and each leaf is 32 padded bytes,
+// so a node's padded coverage is 32 << L bytes. Use [SnapshotLayerIndex] to
+// compute the layer for a target section size. For example, layer 17 gives
+// ~4 MiB sections, layer 6 gives ~2 KiB sections.
+//
+// The layer index is validated against the final tree height during
+// DigestWithSnapshot. If the requested layer exceeds the tree height for the
+// data actually written, DigestWithSnapshot returns a nil snapshot.
+func NewCalcWithSnapshot(layerIdx int) *Calc {
+	if layerIdx < 1 {
+		layerIdx = 1
+	}
+	return &Calc{
+		snapshot: &snapshotState{
+			layerIdx: layerIdx,
+		},
+	}
+}
+
+// DigestWithSnapshot returns the CommP digest and the captured snapshot layer.
+// The Calc must have been created with NewCalcWithSnapshot; returns an error
+// otherwise.
+//
+// If the requested layer index exceeds the tree height for the data written,
+// the CommP and padded size are still returned but snapshot will be nil
+// (err == nil). This allows callers to always obtain a valid CommP regardless
+// of whether the data was large enough for the requested snapshot granularity.
+//
+// Calling plain Digest() on a snapshot-enabled Calc discards collected snapshot
+// nodes and returns only the CommP.
+//
+// On success, the internal state is reset. On error, callers must call Reset()
+// before abandoning the Calc.
+func (cp *Calc) DigestWithSnapshot() (commP []byte, paddedPieceSize uint64, snapshot *SnapshotLayer, err error) {
+	if cp.snapshot == nil {
+		return nil, 0, nil, xerrors.New("DigestWithSnapshot called on Calc without snapshot configuration; use NewCalcWithSnapshot")
+	}
+
+	cp.mu.Lock()
+	defer cp.mu.Unlock()
+
+	// digestCore flushes the buffer and drains the layer pipeline. When it
+	// returns, all goroutines have completed and all snapshot nodes have been
+	// collected.
+	commP, paddedPieceSize, err = cp.digestCore()
+	if err != nil {
+		return nil, 0, nil, err
+	}
+
+	layerIdx := cp.snapshot.layerIdx
+
+	// If the requested layer exceeds the tree height, return the CommP but
+	// no snapshot. The caller can check for nil to detect this case.
+	numLeaves := paddedPieceSize / 32
+	treeHeight := bits.Len64(numLeaves - 1)
+	if layerIdx > treeHeight {
+		cp.state = state{}
+		cp.snapshot.nodes = cp.snapshot.nodes[:0]
+		return commP, paddedPieceSize, nil, nil
+	}
+
+	// Compute expected node count from the actual padded size and zero-pad
+	// any trailing nodes for pieces that don't fill their padded size
+	expectedNodes := int(numLeaves >> uint(layerIdx))
+
+	out := make([][32]byte, expectedNodes)
+	copy(out, cp.snapshot.nodes)
+
+	if len(cp.snapshot.nodes) < expectedNodes {
+		var pad [32]byte
+		copy(pad[:], stackedNulPadding[layerIdx])
+		for i := len(cp.snapshot.nodes); i < expectedNodes; i++ {
+			out[i] = pad
+		}
+	}
+
+	// Reset state
+	cp.state = state{}
+	cp.snapshot.nodes = cp.snapshot.nodes[:0]
+
+	return commP, paddedPieceSize, &SnapshotLayer{
+		LayerIndex: layerIdx,
+		Nodes:      out,
+	}, nil
 }
 
 // PadCommP is experimental, do not use it.

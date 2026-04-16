@@ -3,8 +3,8 @@ module github.com/filecoin-project/go-fil-commp-hashhash
 go 1.25
 
 require (
-	github.com/minio/sha256-simd v1.0.1-0.20230130105256-d9c3aea9e949
-	golang.org/x/xerrors v0.0.0-20220907171357-04be3eba64a2
+	github.com/minio/sha256-simd v1.0.1
+	golang.org/x/xerrors v0.0.0-20240903120638-7835f813f4da
 )
 
 require (
