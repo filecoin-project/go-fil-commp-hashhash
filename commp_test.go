@@ -60,7 +60,7 @@ func TestCommP(t *testing.T) {
 			pr, pw := io.Pipe()
 			var randErr error
 			go func() {
-				defer pw.Close()
+				defer pw.Close() //nolint:errcheck
 
 				// This go-routine logic is the same as in
 				// jbenet/go-random. It's copied here to allow doing
@@ -223,7 +223,7 @@ func getTestCases(path string, shortOnly bool) ([]testCase, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer f.Close() //nolint:errcheck
 
 	lineScanner := bufio.NewScanner(f)
 	for lineScanner.Scan() {
