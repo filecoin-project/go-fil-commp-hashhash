@@ -33,8 +33,5 @@ commP, paddedSize, snapshot, err := cp.DigestWithSnapshot()
 
 See the [GoDoc](https://pkg.go.dev/github.com/filecoin-project/go-fil-commp-hashhash) for details.
 
-## Lead Maintainer
-[Peter 'ribasushi' Rabbitson](https://github.com/ribasushi)
-
 ## License
 [SPDX-License-Identifier: Apache-2.0 OR MIT](LICENSE.md)
