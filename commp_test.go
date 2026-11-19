@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/base32"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -290,42 +291,95 @@ func TestResetWithoutWrite(t *testing.T) {
 	cp.Reset()
 }
 
-// TestDigestErrorThenReset verifies that Reset() correctly cleans up after
-// Digest() returns an error due to insufficient data. When Digest() errors,
-// it does NOT close channels, so callers must call Reset() for cleanup.
-func TestDigestErrorThenReset(t *testing.T) {
-	cp := &Calc{}
+// Roots of zero-filled trees: the FRC-0069 empty piece, 128 bytes, and each of
+// its 64 byte halves
+const (
+	emptyPieceRoot = "3731bb99ac689f66eef5973e4a94da188f4ddcae580724fc6f3fd60dfd488333"
+	zero64Root     = "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb0b"
+)
 
-	// Write less than MinPiecePayload (65 bytes)
-	data := make([]byte, 23)
-	_, err := cp.Write(data)
-	if err != nil {
-		t.Fatalf("Write failed: %v", err)
+// TestShortInputs verifies that inputs shorter than 127 bytes are zero-padded
+// to 127 bytes, as FRC-0069 specifies.
+func TestShortInputs(t *testing.T) {
+	digest := func(data []byte) ([]byte, uint64) {
+		t.Helper()
+		cp := &Calc{}
+		if _, err := cp.Write(data); err != nil {
+			t.Fatalf("Write failed: %v", err)
+		}
+		commP, size, err := cp.Digest()
+		if err != nil {
+			t.Fatalf("Digest failed: %v", err)
+		}
+		return commP, size
 	}
 
-	// Digest returns error for insufficient data
-	_, _, err = cp.Digest()
-	if err == nil {
-		t.Fatal("Expected error from Digest() with insufficient data")
+	// Roots of the FRC-0069 test vectors
+	vectors := []struct {
+		data []byte
+		root string
+	}{
+		{nil, emptyPieceRoot},
+		{bytes.Repeat([]byte{0x01}, 1), "0dd6dae41c2f75550129594fb644e4a842cfafb316a2d59321e388fe84a1ec2f"},
+		{bytes.Repeat([]byte{0x01}, 64), "4183cf8d35d668dd506b26c93bc83eb273b51029640b3ab498997370d8c0953f"},
+	}
+	for _, v := range vectors {
+		commP, size := digest(v.data)
+		if got := hex.EncodeToString(commP); got != v.root || size != 128 {
+			t.Errorf("%d bytes: got %s (%d), expected %s (128)", len(v.data), got, size, v.root)
+		}
 	}
 
-	// Reset cleans up goroutine - must not panic
-	cp.Reset()
+	for n := 0; n < 127; n++ {
+		padded := make([]byte, 127)
+		for i := 0; i < n; i++ {
+			padded[i] = byte(i + 1)
+		}
+		short, shortSize := digest(padded[:n])
+		full, _ := digest(padded)
+		if !bytes.Equal(short, full) || shortSize != 128 {
+			t.Errorf("%d bytes: got %x (%d), expected %x (128)", n, short, shortSize, full)
+		}
+	}
 }
 
-// TestDigestWithoutWrite verifies Digest() without any writes returns an
-// error and does not panic. No goroutine is started in this case.
+// TestDigestWithoutWrite verifies Digest() without any writes returns the
+// commP of an empty input. No goroutine is started in this case.
 func TestDigestWithoutWrite(t *testing.T) {
 	cp := &Calc{}
 
-	// Digest with no data returns error
-	_, _, err := cp.Digest()
-	if err == nil {
-		t.Fatal("Expected error from Digest() with no data")
+	commP, size, err := cp.Digest()
+	if err != nil {
+		t.Fatalf("Digest failed: %v", err)
+	}
+	if got := hex.EncodeToString(commP); got != emptyPieceRoot || size != 128 {
+		t.Errorf("got %s (%d), expected %s (128)", got, size, emptyPieceRoot)
 	}
 
 	// Reset on never-initialized calc is safe
 	cp.Reset()
+}
+
+// TestSnapshotWithoutWrite verifies DigestWithSnapshot() without any writes
+// returns the zero-filled 128 byte piece and its layer.
+func TestSnapshotWithoutWrite(t *testing.T) {
+	cp := NewCalcWithSnapshot(1)
+
+	commP, size, snapshot, err := cp.DigestWithSnapshot()
+	if err != nil {
+		t.Fatalf("DigestWithSnapshot failed: %v", err)
+	}
+	if got := hex.EncodeToString(commP); got != emptyPieceRoot || size != 128 {
+		t.Errorf("got %s (%d), expected %s (128)", got, size, emptyPieceRoot)
+	}
+	if snapshot == nil || len(snapshot.Nodes) != 2 {
+		t.Fatalf("expected 2 snapshot nodes, got %+v", snapshot)
+	}
+	for _, node := range snapshot.Nodes {
+		if got := hex.EncodeToString(node[:]); got != zero64Root {
+			t.Errorf("got node %s, expected %s", got, zero64Root)
+		}
+	}
 }
 
 // TestMultipleResets verifies that calling Reset() multiple times is safe.
@@ -344,12 +398,11 @@ func TestMultipleResets(t *testing.T) {
 	cp.Reset()
 }
 
-// TestReuseAfterDigestError verifies that a Calc can be reused after
-// Digest() returns an error, provided Reset() is called first.
-func TestReuseAfterDigestError(t *testing.T) {
+// TestReuseAfterShortDigest verifies that a Calc is reusable after digesting
+// an input shorter than 127 bytes.
+func TestReuseAfterShortDigest(t *testing.T) {
 	cp := &Calc{}
 
-	// Write 64 bytes (one less than MinPiecePayload)
 	data := make([]byte, 64)
 	for i := range data {
 		data[i] = byte(i)
@@ -359,16 +412,15 @@ func TestReuseAfterDigestError(t *testing.T) {
 		t.Fatalf("Write failed: %v", err)
 	}
 
-	// Digest fails due to insufficient data
-	_, _, err = cp.Digest()
-	if err == nil {
-		t.Fatal("Expected error from Digest() with 64 bytes")
+	_, size, err := cp.Digest()
+	if err != nil {
+		t.Fatalf("Digest failed: %v", err)
+	}
+	if size != 128 {
+		t.Errorf("Expected piece size 128, got %d", size)
 	}
 
-	// Reset to clean up
-	cp.Reset()
-
-	// Calc is reusable after reset
+	// Calc is reusable after digest
 	data2 := make([]byte, 127)
 	for i := range data2 {
 		data2[i] = byte(i)
