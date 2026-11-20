@@ -72,10 +72,12 @@ const MaxPieceSize = uint64(1 << (MaxLayers + 5))
 // of MaxLayers.
 const MaxPiecePayload = MaxPieceSize / 128 * 127
 
-// MinPiecePayload is the smallest amount of data for which FR32 padding has
-// a defined result. It is not possible to derive a Digest() before Write()ing
-// at least this amount of bytes.
-const MinPiecePayload = uint64(65)
+// MinPiecePayload is the smallest amount of data Digest() accepts. Inputs
+// shorter than 127 bytes, including empty input, are zero-padded to 127 bytes
+// as FRC-0069 specifies.
+//
+// Deprecated: every input size is accepted, so this is always 0.
+const MinPiecePayload = uint64(0)
 
 const (
 	commpDigestSize = sha256simd.Size
@@ -143,8 +145,8 @@ func (cp *Calc) Sum(buf []byte) []byte {
 }
 
 // Digest collapses the internal hash state and returns the resulting raw 32
-// bytes of commP and the padded piece size, or alternatively an error in
-// case of insufficient accumulated state. On success, the internal state is
+// bytes of commP and the padded piece size. Inputs shorter than 127 bytes are
+// zero-padded to 127 bytes, a 128 byte piece. On success, the internal state is
 // reset and all goroutines are terminated. On error, callers must call
 // Reset() to clean up background goroutines before abandoning the Calc object.
 func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
@@ -165,11 +167,10 @@ func (cp *Calc) Digest() (commP []byte, paddedPieceSize uint64, err error) {
 // Caller must hold cp.mu. After this returns successfully, all layer
 // goroutines have completed and all snapshot nodes have been collected.
 func (cp *Calc) digestCore() (commP []byte, paddedPieceSize uint64, err error) {
-	if processed := cp.quadsEnqueued*uint64(quadPayload) + uint64(len(cp.buffer)); processed < MinPiecePayload {
-		return nil, 0, xerrors.Errorf(
-			"insufficient state accumulated: commP is not defined for inputs shorter than %d bytes, but only %d processed so far",
-			MinPiecePayload, processed,
-		)
+	// Nothing written: the layer goroutines never started, and the commP is
+	// that of a zero-filled 128 byte piece
+	if cp.buffer == nil {
+		return append([]byte(nil), stackedNulPadding[2]...), 128, nil
 	}
 
 	// If any, flush remaining bytes padded up with zeroes
