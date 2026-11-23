@@ -73,10 +73,10 @@ TEXT ·pairwiseReduceBufferX16Soa(SB), 0, $1024-24
 	MOVQ buf+0(FP), DI
 	MOVQ byteLen+8(FP), SI
 	MOVQ outPairCount+16(FP), DX
-	CALL ·pairwiseReduceBufferX16SoaInner(SB)
+	CALL pairwiseReduceBufferX16SoaInner<>(SB)
 	RET
 
-TEXT ·pairwiseReduceBufferX16SoaInner(SB), 7, $0
+TEXT pairwiseReduceBufferX16SoaInner<>(SB), 7, $0
 //     MOVQ buf+0(FP), DI
 //     MOVQ byteLen+8(FP), SI
 //     MOVQ outPairCount+16(FP), DX

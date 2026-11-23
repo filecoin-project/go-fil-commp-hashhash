@@ -137,10 +137,10 @@ TEXT ·pairwiseReduceBufferX8Avx2(SB), 0, $1088-24
 	MOVQ buf+0(FP), DI
 	MOVQ byteLen+8(FP), SI
 	MOVQ outPairCount+16(FP), DX
-	CALL ·pairwiseReduceBufferX8Avx2Inner(SB)
+	CALL pairwiseReduceBufferX8Avx2Inner<>(SB)
 	RET
 
-TEXT ·pairwiseReduceBufferX8Avx2Inner(SB), 7, $0
+TEXT pairwiseReduceBufferX8Avx2Inner<>(SB), 7, $0
 // TEXT ·funcName(SB), NOSPLIT|NOFRAME, $0-NN
 //     MOVQ buf+0(FP), DI
 //     MOVQ byteLen+8(FP), SI

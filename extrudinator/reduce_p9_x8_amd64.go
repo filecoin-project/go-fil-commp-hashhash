@@ -35,9 +35,6 @@ import "golang.org/x/sys/cpu"
 //go:noescape
 func pairwiseReduceBufferX8Avx2(buf *byte, byteLen int, outPairCount int)
 
-//go:noescape
-func pairwiseReduceBufferX8Avx2Inner()
-
 func init() {
 	if cpu.X86.HasAVX2 && !cpu.X86.HasAVX512 {
 		simdReduceFunc = func(buf []byte, byteLen, outPairCount int) {
