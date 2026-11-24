@@ -14,6 +14,7 @@ import (
 	"math/bits"
 	"sync"
 
+	"github.com/filecoin-project/go-fil-commp-hashhash/extrudinator"
 	sha256simd "github.com/minio/sha256-simd"
 	"golang.org/x/xerrors"
 )
@@ -181,7 +182,9 @@ func (cp *Calc) digestCore() (commP []byte, paddedPieceSize uint64, err error) {
 		for len(cp.buffer) > 0 {
 			// FIXME: there is a smarter way to do this instead of 127-at-a-time,
 			// but that's for another PR
-			cp.digestQuads(cp.buffer[:127])
+			chunk := make([]byte, 127, 128)
+			copy(chunk, cp.buffer[:127])
+			cp.digestQuads(chunk)
 			cp.buffer = cp.buffer[127:]
 		}
 	}
@@ -226,7 +229,7 @@ func (cp *Calc) Write(input []byte) (int, error) {
 
 	// just starting: initialize internal state, start first background layer-goroutine
 	if cp.buffer == nil {
-		cp.buffer = make([]byte, 0, bufferSize)
+		cp.buffer = make([]byte, 0, bufferSize*128/127+512)
 		cp.resultCommP = make(chan []byte, 1)
 		cp.layerQueues[0] = make(chan []byte, layerQueueDepth)
 		cp.addLayer(0)
@@ -245,12 +248,14 @@ func (cp *Calc) Write(input []byte) (int, error) {
 		input = input[toSplice:]
 
 		cp.digestQuads(cp.buffer)
-		cp.buffer = cp.buffer[:0]
+		cp.buffer = make([]byte, 0, bufferSize*128/127+512)
 	}
 
 	// FIXME: suboptimal, limits each slab to a buffer size, but could go exponentially larger
 	for len(input) >= bufferSize {
-		cp.digestQuads(input[:bufferSize])
+		cp.buffer = append(cp.buffer, input[:bufferSize]...)
+		cp.digestQuads(cp.buffer)
+		cp.buffer = make([]byte, 0, bufferSize*128/127+512)
 		input = input[bufferSize:]
 	}
 
@@ -262,57 +267,16 @@ func (cp *Calc) Write(input []byte) (int, error) {
 }
 
 // always called with power-of-2 amount of quads
-func (cp *Calc) digestQuads(inSlab []byte) {
-
-	quadsCount := len(inSlab) / 127
+func (cp *Calc) digestQuads(inBuf []byte) {
+	quadsCount := len(inBuf) / 127
 	cp.quadsEnqueued += uint64(quadsCount)
-	outSlab := make([]byte, quadsCount*128)
 
-	for j := 0; j < quadsCount; j++ {
-		// Cycle over four(4) 31-byte groups, leaving 1 byte in between:
-		// 31 + 1 + 31 + 1 + 31 + 1 + 31 = 127
-		input := inSlab[j*127 : (j+1)*127]
-		expander := outSlab[j*128 : (j+1)*128]
-		inputPlus1, expanderPlus1 := input[1:], expander[1:]
+	// in place: 127 bytes per quad go in, 128 bytes per quad come out
+	// the kernel reads 128 bytes of the last quad, 1 past its payload
+	buf := inBuf[:quadsCount*128]
+	extrudinator.ExtrudeQuads(buf)
 
-		// First 31 bytes + 6 bits are taken as-is (trimmed later)
-		// Note that copying them into the expansion buffer is mandatory:
-		// we will be feeding it to the workers which reuse the bottom half
-		// of the chunk for the result
-		copy(expander[:], input[:32])
-
-		// first 2-bit "shim" forced into the otherwise identical bitstream
-		expander[31] &= 0x3F
-
-		//  In: {{ C[7] C[6] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
-		// Out:                 X[5] X[4] X[3] X[2] X[1] X[0] C[7] C[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] Z[5] Z[4] Z[3]...
-		for i := 31; i < 63; i++ {
-			expanderPlus1[i] = inputPlus1[i]<<2 | input[i]>>6
-		}
-
-		// next 2-bit shim
-		expander[63] &= 0x3F
-
-		//  In: {{ C[7] C[6] C[5] C[4] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
-		// Out:                           X[3] X[2] X[1] X[0] C[7] C[6] C[5] C[4] Y[3] Y[2] Y[1] Y[0] X[7] X[6] X[5] X[4] Z[3] Z[2] Z[1]...
-		for i := 63; i < 95; i++ {
-			expanderPlus1[i] = inputPlus1[i]<<4 | input[i]>>4
-		}
-
-		// next 2-bit shim
-		expander[95] &= 0x3F
-
-		//  In: {{ C[7] C[6] C[5] C[4] C[3] C[2] }} X[7] X[6] X[5] X[4] X[3] X[2] X[1] X[0] Y[7] Y[6] Y[5] Y[4] Y[3] Y[2] Y[1] Y[0] Z[7] Z[6] Z[5]...
-		// Out:                                     X[1] X[0] C[7] C[6] C[5] C[4] C[3] C[2] Y[1] Y[0] X[7] X[6] X[5] X[4] X[3] X[2] Z[1] Z[0] Y[7]...
-		for i := 95; i < 126; i++ {
-			expanderPlus1[i] = inputPlus1[i]<<6 | input[i]>>2
-		}
-
-		// the final 6 bit remainder is exactly the value of the last expanded byte
-		expander[127] = input[126] >> 2
-	}
-
-	cp.layerQueues[0] <- outSlab
+	cp.layerQueues[0] <- buf
 }
 
 func (cp *Calc) addLayer(myIdx uint) {
@@ -351,8 +315,8 @@ func (cp *Calc) addLayer(myIdx uint) {
 
 				if twinHold != nil {
 					copy(twinHold[32:64], stackedNulPadding[myIdx])
-					cp.hashSlab254(s256, 0, collectSnapshot, twinHold[0:64])
-					cp.layerQueues[myIdx+1] <- twinHold[0:64:64]
+					cp.hashSlab254(s256, collectSnapshot, twinHold[0:64])
+					cp.layerQueues[myIdx+1] <- twinHold[0:32:64]
 				}
 
 				// signal the next in line that they are done too
@@ -361,12 +325,13 @@ func (cp *Calc) addLayer(myIdx uint) {
 			}
 
 			switch {
-			case uint64(len(slab)) > uint64(1<<(5+myIdx)): // uint64 cast needed on 32-bit systems
-				cp.hashSlab254(s256, myIdx, collectSnapshot, slab)
-				cp.layerQueues[myIdx+1] <- slab
+			case len(slab) >= 64:
+				nPairs := len(slab) / 64
+				cp.hashSlab254(s256, collectSnapshot, slab)
+				cp.layerQueues[myIdx+1] <- slab[:nPairs*32]
 			case twinHold != nil:
 				copy(twinHold[32:64], slab[0:32])
-				cp.hashSlab254(s256, 0, collectSnapshot, twinHold[0:64])
+				cp.hashSlab254(s256, collectSnapshot, twinHold[0:64])
 				cp.layerQueues[myIdx+1] <- twinHold[0:32:64]
 				twinHold = nil
 			default:
@@ -386,17 +351,38 @@ func (cp *Calc) addLayer(myIdx uint) {
 	}()
 }
 
-func (cp *Calc) hashSlab254(h hash.Hash, layerIdx uint, collectSnapshot bool, slab []byte) {
-	stride := 1 << (5 + layerIdx)
-	for i := 0; len(slab) > i+stride; i += 2 * stride {
-		h.Reset()
-		h.Write(slab[i : i+32])
-		h.Write(slab[i+stride : 32+i+stride])
-		h.Sum(slab[i:i])[31] &= 0x3F // callers expect we will reuse-reduce-recycle
+// hashes every pair of buf, results packed at the front: [L0|R0|L1|R1] -> [H0|H1]
+func (cp *Calc) hashSlab254(h hash.Hash, collectSnapshot bool, buf []byte) {
+	nPairs := len(buf) / 64
 
-		if collectSnapshot {
+	// 4 pairs and more go to the SIMD kernel, when this CPU has one
+	// the kernel can accept 2+ pairs, under 4 pairs it's not worth doing SIMD
+	// nPairs/2 makes it stop after one level: 8 pairs in -> 8 hashes out = 4 pairs
+	// the kernel wants 512 bytes of room behind buf
+	if nPairs >= 4 && extrudinator.HasSIMDReduce() {
+		if cap(buf)-len(buf) >= 512 {
+			extrudinator.PairwiseReduceBuffer(buf, len(buf), nPairs/2)
+		} else {
+			tmp := make([]byte, len(buf)+512)
+			copy(tmp, buf)
+			extrudinator.PairwiseReduceBuffer(tmp, len(buf), nPairs/2)
+			copy(buf, tmp[:len(buf)])
+		}
+	} else {
+		for i := 0; i < nPairs; i++ {
+			h.Reset()
+			h.Write(buf[i*64 : i*64+32])
+			h.Write(buf[i*64+32 : i*64+64])
+			h.Sum(buf[i*32 : i*32 : i*32+32])
+			buf[i*32+31] &= 0x3F
+		}
+	}
+
+	// the hashes just made are the nodes of the snapshot layer
+	if collectSnapshot {
+		for i := 0; i < nPairs; i++ {
 			var node [32]byte
-			copy(node[:], slab[i:i+32])
+			copy(node[:], buf[i*32:i*32+32])
 			cp.snapshot.nodes = append(cp.snapshot.nodes, node)
 		}
 	}
